@@ -1,0 +1,39 @@
+databases:
+  # MySQL test database
+  mysql-test:
+    type: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: "${TEST_BACKUP_DIR}/mysql"
+    compression: gz
+    retention:
+      keep_last: 3
+
+  # MariaDB test database
+  mariadb-test:
+    type: mysql
+    host: 127.0.0.1
+    port: 3307
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: "${TEST_BACKUP_DIR}/mariadb"
+    compression: gz
+    retention:
+      keep_last: 3
+
+  # PostgreSQL test database
+  postgres-test:
+    type: postgres
+    host: 127.0.0.1
+    port: 5432
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: "${TEST_BACKUP_DIR}/postgres"
+    compression: gz
+    retention:
+      keep_last: 3

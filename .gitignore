@@ -1,0 +1,7 @@
+blobber
+blobber.yaml
+*.exe
+
+# Dev environment generated files
+dev/test.db
+dev/backups/
