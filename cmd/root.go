@@ -18,8 +18,8 @@ var cfgPath string
 
 var rootCmd = &cobra.Command{
 	Use:   "blobber",
-	Short: "Database backup tool with cloud storage",
-	Long: `Blobber backs up databases (SQLite, MySQL, PostgreSQL) to cloud storage using rclone.
+	Short: "Database backup and restore tool with cloud storage",
+	Long: `Blobber backs up and restores databases (SQLite, MySQL, PostgreSQL) to cloud storage using rclone.
 
 Run without arguments to launch the interactive TUI.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {

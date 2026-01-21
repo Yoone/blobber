@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/dustin/go-humanize"
 	"github.com/rclone/rclone/fs"
 	rcloneconfig "github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -142,13 +143,13 @@ type backupLogEntry struct {
 
 // dbBackupState tracks the backup state for a single database
 type dbBackupState struct {
-	currentStep     backupStep       // current step (stepIdle when done)
-	logs            []backupLogEntry // completed steps
-	result          *backup.Result   // result from dump step (for upload)
-	done            bool             // true when all steps complete
-	uploadBytesDone int64            // bytes uploaded so far
-	uploadBytesTotal int64           // total bytes to upload
-	uploadSpeed     float64          // upload speed in bytes/second
+	currentStep      backupStep       // current step (stepIdle when done)
+	logs             []backupLogEntry // completed steps
+	result           *backup.Result   // result from dump step (for upload)
+	done             bool             // true when all steps complete
+	uploadBytesDone  int64            // bytes uploaded so far
+	uploadBytesTotal int64            // total bytes to upload
+	uploadSpeed      float64          // upload speed in bytes/second
 }
 
 // restoreStep represents the current step in the restore process
@@ -220,23 +221,23 @@ type uploadState struct {
 }
 
 type model struct {
-	cfg            *config.Config
-	view           view
-	cursor         int
-	width          int // terminal width for dynamic sizing
-	dbNames        []string
-	selected       map[string]bool // for backup multi-select
-	skipRetention  bool            // skip retention policy for this backup run
-	dryRun         bool            // perform dump but skip upload and retention
-	selectedDB          string // for restore
-	backupFiles         []storage.RemoteFile
-	backupFilesLoading  bool   // true while fetching backup files
-	selectedFile        string
-	selectedFileSize    int64  // size of selected file for restore
-	isLocalRestore bool // true if restoring from local file
-	logs           []string
-	err            error
-	quitting       bool
+	cfg                *config.Config
+	view               view
+	cursor             int
+	width              int // terminal width for dynamic sizing
+	dbNames            []string
+	selected           map[string]bool // for backup multi-select
+	skipRetention      bool            // skip retention policy for this backup run
+	dryRun             bool            // perform dump but skip upload and retention
+	selectedDB         string          // for restore
+	backupFiles        []storage.RemoteFile
+	backupFilesLoading bool // true while fetching backup files
+	selectedFile       string
+	selectedFileSize   int64 // size of selected file for restore
+	isLocalRestore     bool  // true if restoring from local file
+	logs               []string
+	err                error
+	quitting           bool
 
 	// Spinner for progress indication
 	spinner spinner.Model
@@ -272,8 +273,8 @@ type model struct {
 	testConnResult  string // result of connection test (MySQL/Postgres page 1)
 	testDestResult  string // result of destination test (page 2)
 	formError       string // validation error to display in form
-	pendingSave     bool // true when form completed and running pre-save tests
-	pendingDestTest bool // true when destination test should run after connection test
+	pendingSave     bool   // true when form completed and running pre-save tests
+	pendingDestTest bool   // true when destination test should run after connection test
 
 	// Database list/edit/delete (viewDBList)
 	editingDB      string   // name of database being edited (empty for add)
@@ -303,16 +304,16 @@ type model struct {
 	restoreFormData *restoreFormFields // heap-allocated form values
 
 	// Rclone management
-	rcloneRemotes            []string           // list of configured remote names
-	rcloneRemoteFilter       string             // search filter for remote list
-	rcloneRemoteFilteredList []string           // remotes filtered by search
-	rcloneBackends           []*fs.RegInfo      // available backends (filtered, non-hidden)
-	rcloneFilteredList       []*fs.RegInfo      // backends filtered by search
-	rcloneFilter             string             // search filter text
-	selectedRemote           string             // currently selected remote for actions
-	selectedBackend          *fs.RegInfo        // backend type for new remote
-	rcloneForm               *huh.Form          // dynamic form for remote config
-	rcloneFormValues         map[string]*string // pointers to form values
+	rcloneRemotes            []string              // list of configured remote names
+	rcloneRemoteFilter       string                // search filter for remote list
+	rcloneRemoteFilteredList []string              // remotes filtered by search
+	rcloneBackends           []*fs.RegInfo         // available backends (filtered, non-hidden)
+	rcloneFilteredList       []*fs.RegInfo         // backends filtered by search
+	rcloneFilter             string                // search filter text
+	selectedRemote           string                // currently selected remote for actions
+	selectedBackend          *fs.RegInfo           // backend type for new remote
+	rcloneForm               *huh.Form             // dynamic form for remote config
+	rcloneFormValues         map[string]*string    // pointers to form values
 	showAdvanced             bool                  // toggle for advanced options
 	advancedLoaded           bool                  // true after form rebuilt with advanced options
 	advancedStartPage        int                   // page index where advanced options start
@@ -2739,7 +2740,7 @@ func (m model) renderRetentionPreConfirm() string {
 				s.WriteString("\n")
 				break
 			}
-			sizeStr := fmt.Sprintf("%.2f MB", float64(f.Size)/(1024*1024))
+			sizeStr := humanize.IBytes(uint64(f.Size))
 			s.WriteString(fmt.Sprintf("  • %s %s\n", f.Name, dimStyle.Render("("+sizeStr+")")))
 		}
 	}
@@ -2828,7 +2829,16 @@ func (m model) renderBackupRunning() string {
 
 		// Show current step with spinner (if not done)
 		if !state.done && state.currentStep != stepIdle {
-			s.WriteString(fmt.Sprintf("    %s %s...\n", m.spinner.View(), state.currentStep.String()))
+			stepName := state.currentStep.String()
+			// Add compression info for dump step
+			if state.currentStep == stepDumping {
+				if db, ok := m.cfg.Databases[dbName]; ok {
+					if label := backup.CompressionLabel(db.Compression); label != "" {
+						stepName = fmt.Sprintf("Dumping & compressing database (%s)", label)
+					}
+				}
+			}
+			s.WriteString(fmt.Sprintf("    %s %s...\n", m.spinner.View(), stepName))
 
 			// Show progress bar for upload step
 			if state.currentStep == stepUploading && state.uploadBytesTotal > 0 {
@@ -2844,10 +2854,10 @@ func (m model) renderBackupRunning() string {
 
 				// Size and speed info
 				s.WriteString(fmt.Sprintf("       %s / %s",
-					formatFileSize(state.uploadBytesDone),
-					formatFileSize(state.uploadBytesTotal)))
+					humanize.IBytes(uint64(state.uploadBytesDone)),
+					humanize.IBytes(uint64(state.uploadBytesTotal))))
 				if state.uploadSpeed > 0 {
-					s.WriteString(fmt.Sprintf(" • %s/s", formatFileSize(int64(state.uploadSpeed))))
+					s.WriteString(fmt.Sprintf(" • %s/s", humanize.IBytes(uint64(state.uploadSpeed))))
 				}
 				s.WriteString("\n")
 			}
@@ -2881,6 +2891,14 @@ func (m model) renderRestoreRunning() string {
 	// Show current step with spinner
 	if m.restoreStep != restoreStepIdle {
 		stepStr := m.restoreStep.String()
+		// Add decompression info for restore step
+		if m.restoreStep == restoreStepRestoring {
+			if comp := backup.CompressionFromFilename(m.selectedFile); comp != "" {
+				if label := backup.CompressionLabel(comp); label != "" {
+					stepStr = fmt.Sprintf("Decompressing & restoring database (%s)", label)
+				}
+			}
+		}
 		s.WriteString(fmt.Sprintf("  %s %s...\n", m.spinner.View(), stepStr))
 
 		// Show progress bar for download step
@@ -2898,10 +2916,10 @@ func (m model) renderRestoreRunning() string {
 
 			// Size and speed info
 			s.WriteString(fmt.Sprintf("     %s / %s",
-				formatFileSize(m.downloadBytesDone),
-				formatFileSize(m.selectedFileSize)))
+				humanize.IBytes(uint64(m.downloadBytesDone)),
+				humanize.IBytes(uint64(m.selectedFileSize))))
 			if m.downloadSpeed > 0 {
-				s.WriteString(fmt.Sprintf(" • %s/s", formatFileSize(int64(m.downloadSpeed))))
+				s.WriteString(fmt.Sprintf(" • %s/s", humanize.IBytes(uint64(m.downloadSpeed))))
 			}
 			s.WriteString("\n")
 		}
@@ -2919,25 +2937,6 @@ func truncateString(s string, maxLen int) string {
 		return s[:maxLen]
 	}
 	return s[:maxLen-3] + "..."
-}
-
-// formatFileSize formats a file size in bytes to a human-readable string
-func formatFileSize(bytes int64) string {
-	const (
-		KB = 1024
-		MB = KB * 1024
-		GB = MB * 1024
-	)
-	switch {
-	case bytes >= GB:
-		return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
-	case bytes >= MB:
-		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
-	case bytes >= KB:
-		return fmt.Sprintf("%.2f KB", float64(bytes)/KB)
-	default:
-		return fmt.Sprintf("%d bytes", bytes)
-	}
 }
 
 func (m model) renderRestoreDBSelect() string {
@@ -3060,7 +3059,7 @@ func (m model) renderRestoreFileSelect() string {
 		for i := start; i < end; i++ {
 			f := m.restoreFileFilteredList[i]
 			cursor := "  "
-			line := fmt.Sprintf("%s  %8.2f MB  %s", f.ModTime.Format("2006-01-02 15:04"), float64(f.Size)/(1024*1024), f.Name)
+			line := fmt.Sprintf("%s  %10s  %s", f.ModTime.Format("2006-01-02 15:04"), humanize.IBytes(uint64(f.Size)), f.Name)
 			if m.cursor == i {
 				cursor = cursorStyle.Render("▸ ")
 				line = selectedStyle.Render(line)
@@ -3102,7 +3101,7 @@ func (m model) renderRestoreConfirm() string {
 	s.WriteString(fmt.Sprintf("Restore to %s?\n\n", selectedStyle.Render(m.selectedDB)))
 	s.WriteString(fmt.Sprintf("  File: %s\n", m.selectedFile))
 	if fileSize > 0 {
-		s.WriteString(fmt.Sprintf("  Size: %s\n", formatFileSize(fileSize)))
+		s.WriteString(fmt.Sprintf("  Size: %s\n", humanize.IBytes(uint64(fileSize))))
 	}
 	s.WriteString("\n")
 	s.WriteString(errorStyle.Render("⚠ This will overwrite the current database!"))
@@ -3652,7 +3651,7 @@ func (m model) runRetentionPreCheck() tea.Cmd {
 				continue
 			}
 
-			files, err := storage.List(ctx, db.Dest)
+			files, err := storage.ListForDatabase(ctx, db.Dest, name)
 			if err != nil {
 				// Skip this database on error, don't fail the whole check
 				continue
@@ -3706,7 +3705,7 @@ func (m model) runBackupStepFor(name string) tea.Cmd {
 				dbName:  name,
 				step:    stepDumping,
 				result:  result,
-				message: fmt.Sprintf("Dumped %s (%.2f MB)", result.Filename, float64(result.Size)/(1024*1024)),
+				message: fmt.Sprintf("Dumped %s (%s)", result.Filename, humanize.IBytes(uint64(result.Size))),
 			}
 
 		case stepUploading:
@@ -4010,7 +4009,7 @@ func (m model) fetchBackupFiles() tea.Cmd {
 		ctx := context.Background()
 		db := m.cfg.Databases[m.selectedDB]
 
-		files, err := storage.List(ctx, db.Dest)
+		files, err := storage.ListForDatabase(ctx, db.Dest, m.selectedDB)
 		return fileListMsg{files: files, err: err}
 	}
 }
@@ -4124,7 +4123,7 @@ func (m model) waitForDownloadProgress() tea.Cmd {
 			downloadedPath := ds.tmpDir + "/" + ds.fileName
 			return restoreStepDoneMsg{
 				step:      restoreStepDownloading,
-				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, formatFileSize(ds.fileSize)),
+				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, humanize.IBytes(uint64(ds.fileSize))),
 				localPath: downloadedPath,
 			}
 		}
@@ -4136,7 +4135,7 @@ func (m model) waitForDownloadProgress() tea.Cmd {
 			downloadedPath := ds.tmpDir + "/" + ds.fileName
 			return restoreStepDoneMsg{
 				step:      restoreStepDownloading,
-				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, formatFileSize(ds.fileSize)),
+				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, humanize.IBytes(uint64(ds.fileSize))),
 				localPath: downloadedPath,
 			}
 		}

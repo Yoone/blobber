@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/Yoone/blobber/internal/storage"
+	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 )
 
@@ -28,19 +29,19 @@ func runList(ctx context.Context, dbName string) error {
 		return fmt.Errorf("database %q not found in config", dbName)
 	}
 
-	files, err := storage.List(ctx, db.Dest)
+	files, err := storage.ListForDatabase(ctx, db.Dest, dbName)
 	if err != nil {
 		return err
 	}
 
 	if len(files) == 0 {
-		fmt.Println("No backups found")
+		fmt.Printf("[%s] No backups found in %s\n", dbName, db.Dest)
 		return nil
 	}
 
-	fmt.Printf("Backups for %s (%s):\n\n", dbName, db.Dest)
+	fmt.Printf("[%s] %d backup(s) in %s\n", dbName, len(files), db.Dest)
 	for _, f := range files {
-		fmt.Printf("  %s  %10.2f MB  %s\n", f.ModTime.Format("2006-01-02 15:04:05"), float64(f.Size)/(1024*1024), f.Name)
+		fmt.Printf("%s  %s  %s\n", f.Name, f.ModTime.Format("2006-01-02 15:04:05"), humanize.IBytes(uint64(f.Size)))
 	}
 
 	return nil

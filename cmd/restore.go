@@ -8,6 +8,7 @@ import (
 
 	"github.com/Yoone/blobber/internal/backup"
 	"github.com/Yoone/blobber/internal/storage"
+	"github.com/dustin/go-humanize"
 	"github.com/spf13/cobra"
 )
 
@@ -39,10 +40,11 @@ func runRestore(ctx context.Context, dbName, backupFile string, local bool) erro
 	if local {
 		// Use local file directly
 		localPath = backupFile
-		if _, err := os.Stat(localPath); err != nil {
+		stat, err := os.Stat(localPath)
+		if err != nil {
 			return fmt.Errorf("local file not found: %w", err)
 		}
-		fmt.Printf("Restoring from local file %s...\n", localPath)
+		fmt.Printf("[%s] Using local file: %s (%s)\n", dbName, localPath, humanize.IBytes(uint64(stat.Size())))
 	} else {
 		// Download from remote
 		tmpDir, err := os.MkdirTemp("", "blobber-restore-")
@@ -53,17 +55,25 @@ func runRestore(ctx context.Context, dbName, backupFile string, local bool) erro
 
 		localPath = filepath.Join(tmpDir, backupFile)
 
-		fmt.Printf("Downloading %s from %s...\n", backupFile, db.Dest)
+		fmt.Printf("[%s] Downloading %s from %s...\n", dbName, backupFile, db.Dest)
 		if err := storage.Download(ctx, db.Dest, backupFile, tmpDir); err != nil {
 			return fmt.Errorf("downloading backup: %w", err)
 		}
+		stat, _ := os.Stat(localPath)
+		fmt.Printf("[%s] Download completed (%s)\n", dbName, humanize.IBytes(uint64(stat.Size())))
 	}
 
-	fmt.Printf("Restoring to %s...\n", dbName)
+	restoreMsg := "Restoring database"
+	if comp := backup.CompressionFromFilename(localPath); comp != "" {
+		if label := backup.CompressionLabel(comp); label != "" {
+			restoreMsg = fmt.Sprintf("Decompressing & restoring database (%s)", label)
+		}
+	}
+	fmt.Printf("[%s] %s...\n", dbName, restoreMsg)
 	if err := backup.Restore(db, localPath); err != nil {
 		return fmt.Errorf("restoring backup: %w", err)
 	}
 
-	fmt.Println("Restore completed successfully")
+	fmt.Printf("[%s] Restore completed successfully\n", dbName)
 	return nil
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
+	"github.com/Yoone/blobber/internal/backup"
 	"github.com/Yoone/blobber/internal/orchestrator"
 	"github.com/spf13/cobra"
 )
@@ -60,7 +62,7 @@ func runBackup(ctx context.Context, databases []string, dryRun, skipRetention bo
 		return nil
 	}
 
-	fmt.Printf("Backing up %d database(s) in parallel...\n\n", len(databases))
+	fmt.Printf("Starting backup of %d database(s): %s\n", len(databases), strings.Join(databases, ", "))
 
 	// Pre-check retention policies
 	var retentionPlan orchestrator.RetentionPlan
@@ -72,18 +74,9 @@ func runBackup(ctx context.Context, databases []string, dryRun, skipRetention bo
 		}
 	}
 
-	// Track per-database state for display
-	type dbState struct {
-		currentStep orchestrator.BackupStep
-		messages    []string
-		done        bool
-		hasError    bool
-	}
-	states := make(map[string]*dbState)
-	statesMu := sync.Mutex{}
-	for _, name := range databases {
-		states[name] = &dbState{}
-	}
+	// Track errors for summary
+	errors := make(map[string]bool)
+	errorsMu := sync.Mutex{}
 
 	// Progress channel
 	progress := make(chan orchestrator.BackupProgress, 100)
@@ -99,61 +92,50 @@ func runBackup(ctx context.Context, databases []string, dryRun, skipRetention bo
 		close(done)
 	}()
 
-	// Process progress updates
+	// Print progress updates as they come in
 	for p := range progress {
-		statesMu.Lock()
-		state := states[p.DBName]
-		if state == nil {
-			statesMu.Unlock()
-			continue
+		// Get step name, with compression info for dump step
+		stepName := p.Step.String()
+		if p.Step == orchestrator.StepDumping {
+			if db, ok := cfg.Databases[p.DBName]; ok {
+				if label := backup.CompressionLabel(db.Compression); label != "" {
+					stepName = fmt.Sprintf("Dumping & compressing database (%s)", label)
+				}
+			}
 		}
 
-		if p.Message != "" {
-			// Step completed
-			prefix := "  ✓"
+		if p.Error != nil {
+			// Error occurred
+			if p.Message != "" {
+				fmt.Printf("[%s] %s failed: %s\n", p.DBName, stepName, p.Message)
+			} else {
+				fmt.Printf("[%s] %s failed: %v\n", p.DBName, stepName, p.Error)
+			}
+			errorsMu.Lock()
+			errors[p.DBName] = true
+			errorsMu.Unlock()
+		} else if p.Message != "" {
+			// Step completed with message
 			if p.Skipped {
-				prefix = "  ○"
+				fmt.Printf("[%s] %s skipped: %s\n", p.DBName, stepName, p.Message)
+			} else {
+				fmt.Printf("[%s] %s completed: %s\n", p.DBName, stepName, p.Message)
 			}
-			if p.Error != nil {
-				prefix = "  ✗"
-				state.hasError = true
-			}
-			state.messages = append(state.messages, fmt.Sprintf("%s %s", prefix, p.Message))
-		} else if p.Error != nil {
-			// Step failed without message
-			state.messages = append(state.messages, fmt.Sprintf("  ✗ %s: %v", p.Step.String(), p.Error))
-			state.hasError = true
+		} else {
+			// Step starting
+			fmt.Printf("[%s] %s...\n", p.DBName, stepName)
 		}
-
-		state.currentStep = p.Step
-		if p.Done {
-			state.done = true
-		}
-		statesMu.Unlock()
 	}
 
 	<-done
 
-	// Print final results
-	var failed int
-	for _, name := range databases {
-		state := states[name]
-		fmt.Println(name)
-		for _, msg := range state.messages {
-			fmt.Println(msg)
-		}
-		if state.hasError {
-			failed++
-		}
-		fmt.Println()
-	}
-
 	// Summary
+	failed := len(errors)
 	succeeded := len(databases) - failed
 	if failed > 0 {
-		fmt.Printf("Completed: %d succeeded, %d failed\n", succeeded, failed)
+		fmt.Printf("Backup finished: %d succeeded, %d failed\n", succeeded, failed)
 	} else {
-		fmt.Printf("Completed: %d succeeded\n", succeeded)
+		fmt.Printf("Backup finished: %d succeeded\n", succeeded)
 	}
 
 	return nil

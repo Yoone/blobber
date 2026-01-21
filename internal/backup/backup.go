@@ -41,6 +41,35 @@ var compressionExt = map[string]string{
 	"zip":  ".zip",
 }
 
+// compressionLabels maps compression types to human-readable labels
+var compressionLabels = map[string]string{
+	"gz":   "gzip",
+	"zstd": "zstandard",
+	"xz":   "xz",
+	"zip":  "zip",
+}
+
+// CompressionLabel returns a human-readable label for the compression type
+func CompressionLabel(compression string) string {
+	return compressionLabels[compression]
+}
+
+// CompressionFromFilename detects compression type from file extension
+func CompressionFromFilename(filename string) string {
+	switch {
+	case strings.HasSuffix(filename, ".gz"):
+		return "gz"
+	case strings.HasSuffix(filename, ".zst"):
+		return "zstd"
+	case strings.HasSuffix(filename, ".xz"):
+		return "xz"
+	case strings.HasSuffix(filename, ".zip"):
+		return "zip"
+	default:
+		return ""
+	}
+}
+
 // Run performs a backup for the given database and returns the local file path
 func Run(name string, db config.Database) (*Result, error) {
 	start := time.Now()

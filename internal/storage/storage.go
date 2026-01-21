@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,7 +48,7 @@ func Init(configPath string) {
 		// This prevents "CreateBucket: Access Denied" errors when the bucket already exists
 		// but the user doesn't have CreateBucket permission
 		os.Setenv("RCLONE_S3_NO_CHECK_BUCKET", "true")
-		os.Setenv("RCLONE_GCS_NO_CHECK_BUCKET", "true")       // Google Cloud Storage
+		os.Setenv("RCLONE_GCS_NO_CHECK_BUCKET", "true")          // Google Cloud Storage
 		os.Setenv("RCLONE_AZUREBLOB_NO_CHECK_CONTAINER", "true") // Azure Blob
 
 		// Set custom config path if provided
@@ -228,6 +229,24 @@ func List(ctx context.Context, remoteDest string) ([]RemoteFile, error) {
 	})
 
 	return files, nil
+}
+
+// ListForDatabase lists files at the remote destination filtered by database name.
+// Only files with the prefix "{dbName}_" are returned.
+func ListForDatabase(ctx context.Context, remoteDest, dbName string) ([]RemoteFile, error) {
+	files, err := List(ctx, remoteDest)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix := dbName + "_"
+	var filtered []RemoteFile
+	for _, f := range files {
+		if strings.HasPrefix(f.Name, prefix) {
+			filtered = append(filtered, f)
+		}
+	}
+	return filtered, nil
 }
 
 // Download downloads a file from remote storage to local path

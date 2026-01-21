@@ -9,6 +9,7 @@ import (
 	"github.com/Yoone/blobber/internal/config"
 	"github.com/Yoone/blobber/internal/retention"
 	"github.com/Yoone/blobber/internal/storage"
+	"github.com/dustin/go-humanize"
 )
 
 // BackupStep represents a step in the backup process
@@ -71,7 +72,7 @@ func PreCheckRetention(ctx context.Context, cfg *config.Config, databases []stri
 			continue
 		}
 
-		files, err := storage.List(ctx, db.Dest)
+		files, err := storage.ListForDatabase(ctx, db.Dest, name)
 		if err != nil {
 			continue // skip on error, don't fail the whole check
 		}
@@ -137,7 +138,7 @@ func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts 
 		defer backup.Cleanup(backupResult)
 	}
 
-	msg := fmt.Sprintf("Dumped %s (%.2f MB)", backupResult.Filename, float64(backupResult.Size)/(1024*1024))
+	msg := fmt.Sprintf("Dumped %s (%s)", backupResult.Filename, humanize.IBytes(uint64(backupResult.Size)))
 	progress <- BackupProgress{DBName: name, Step: StepDumping, Message: msg}
 	result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepDumping, Message: msg})
 
@@ -173,7 +174,7 @@ func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts 
 		progress <- BackupProgress{DBName: name, Step: StepRetention}
 
 		// Re-fetch files after upload to get accurate count including new backup
-		files, err := storage.List(ctx, db.Dest)
+		files, err := storage.ListForDatabase(ctx, db.Dest, name)
 		if err != nil {
 			progress <- BackupProgress{DBName: name, Step: StepRetention, Error: err, Done: true}
 			result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Error: err})
