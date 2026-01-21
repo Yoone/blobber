@@ -51,10 +51,10 @@ type BackupProgress struct {
 
 // BackupResult contains the final result for a database backup
 type BackupResult struct {
-	DBName   string
-	Success  bool
-	Error    error
-	Steps    []BackupProgress // completed steps
+	DBName  string
+	Success bool
+	Error   error
+	Steps   []BackupProgress // completed steps
 }
 
 // RetentionPlan maps database names to files that would be deleted

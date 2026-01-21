@@ -20,6 +20,9 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
+	"github.com/rclone/rclone/fs"
+	rcloneconfig "github.com/rclone/rclone/fs/config"
+	"github.com/rclone/rclone/fs/config/configmap"
 )
 
 type view int
@@ -27,7 +30,7 @@ type view int
 const (
 	viewMainMenu view = iota
 	viewBackupSelect
-	viewRetentionPreCheck  // checking retention policies before backup
+	viewRetentionPreCheck   // checking retention policies before backup
 	viewRetentionPreConfirm // confirmation before starting backups
 	viewBackupRunning
 	viewRestoreDBSelect
@@ -44,7 +47,18 @@ const (
 	viewEditDBForm
 	viewEditDBFormConfirmExit
 	viewDeleteConfirm
+	viewDBTest // Testing database connection
 	viewDone
+
+	// Rclone management views
+	viewRcloneList               // List configured remotes
+	viewRcloneActions            // Edit/Delete/Test actions for a remote
+	viewRcloneAddType            // Select backend type (s3, azureblob, etc.)
+	viewRcloneAddForm            // Form for configuring the remote
+	viewRcloneAddFormConfirmExit // Confirm exit with unsaved changes
+	viewRcloneDeleteConfirm      // Confirm deletion
+	viewRcloneTest               // Testing remote connection
+	viewRcloneOAuth              // OAuth authentication in progress
 )
 
 // Menu option constants
@@ -53,6 +67,7 @@ const (
 	menuBackup = iota
 	menuRestore
 	menuManage
+	menuManageRclone
 	menuExit
 )
 
@@ -72,8 +87,17 @@ const (
 const (
 	// DB actions options
 	dbActionEdit = iota
+	dbActionTest
 	dbActionDelete
 	dbActionBack
+)
+
+const (
+	// Rclone actions options
+	rcloneActionEdit = iota
+	rcloneActionTest
+	rcloneActionDelete
+	rcloneActionBack
 )
 
 const (
@@ -144,8 +168,8 @@ func (s restoreStep) String() string {
 
 // restoreLogEntry represents a completed restore step
 type restoreLogEntry struct {
-	Message   string
-	IsError   bool
+	Message string
+	IsError bool
 }
 
 // formFields holds form field values in a heap-allocated struct
@@ -171,20 +195,21 @@ type restoreFormFields struct {
 }
 
 type model struct {
-	cfg          *config.Config
-	view         view
-	cursor       int
-	dbNames      []string
-	selected      map[string]bool // for backup multi-select
-	skipRetention bool            // skip retention policy for this backup run
-	dryRun        bool            // perform dump but skip upload and retention
-	selectedDB    string          // for restore
-	backupFiles  []storage.RemoteFile
-	selectedFile string
+	cfg            *config.Config
+	view           view
+	cursor         int
+	width          int // terminal width for dynamic sizing
+	dbNames        []string
+	selected       map[string]bool // for backup multi-select
+	skipRetention  bool            // skip retention policy for this backup run
+	dryRun         bool            // perform dump but skip upload and retention
+	selectedDB     string          // for restore
+	backupFiles    []storage.RemoteFile
+	selectedFile   string
 	isLocalRestore bool // true if restoring from local file
-	logs         []string
-	err          error
-	quitting     bool
+	logs           []string
+	err            error
+	quitting       bool
 
 	// Spinner for progress indication
 	spinner spinner.Model
@@ -194,17 +219,17 @@ type model struct {
 	backupStates map[string]*dbBackupState // per-database state
 
 	// Restore progress tracking
-	restoreStep     restoreStep       // current restore step
-	restoreLogs     []restoreLogEntry // completed restore steps
-	restoreLocalPath string           // path to local file being restored
+	restoreStep      restoreStep       // current restore step
+	restoreLogs      []restoreLogEntry // completed restore steps
+	restoreLocalPath string            // path to local file being restored
 
 	// Retention plan (pre-calculated before backup starts)
 	retentionPlan map[string][]storage.RemoteFile // dbName -> files to delete
 
 	// Add database form (huh)
-	addDBType string       // file, mysql, postgres
-	addDBForm *huh.Form    // huh form for adding database
-	formData  *formFields  // heap-allocated form values (survives bubbletea copies)
+	addDBType string      // file, mysql, postgres
+	addDBForm *huh.Form   // huh form for adding database
+	formData  *formFields // heap-allocated form values (survives bubbletea copies)
 
 	// Test state
 	testRunning     bool   // true while test is running
@@ -214,14 +239,52 @@ type model struct {
 	pendingSave     bool   // true when form completed and running pre-save tests
 	pendingDestTest bool   // true when destination test should run after connection test
 
-	// Database list/edit/delete
-	editingDB  string // name of database being edited (empty for add)
-	listPage   int    // current page in DB list
-	listPageSize int  // items per page
+	// Database list/edit/delete (viewDBList)
+	editingDB      string   // name of database being edited (empty for add)
+	dbFilter       string   // search filter text for database list
+	dbFilteredList []string // databases filtered by search
+
+	// Backup select (viewBackupSelect)
+	backupFilter       string   // search filter for backup database selection
+	backupFilteredList []string // databases filtered by search
+
+	// Restore database select (viewRestoreDBSelect)
+	restoreDBFilter       string   // search filter for restore database selection
+	restoreDBFilteredList []string // databases filtered by search
+
+	// Restore file select (viewRestoreFileSelect)
+	restoreFileFilter       string               // search filter for backup files
+	restoreFileFilteredList []storage.RemoteFile // backup files filtered by search
+
+	// Backup running scroll (viewBackupRunning)
+	backupScrollOffset int // index of first visible DB in backup progress
+
+	// Retention pre-confirm pagination (viewRetentionPreConfirm)
+	retentionDBPage int // current page (0-indexed) in retention preview
 
 	// Restore local path form
 	restorePathForm *huh.Form
 	restoreFormData *restoreFormFields // heap-allocated form values
+
+	// Rclone management
+	rcloneRemotes            []string           // list of configured remote names
+	rcloneRemoteFilter       string             // search filter for remote list
+	rcloneRemoteFilteredList []string           // remotes filtered by search
+	rcloneBackends           []*fs.RegInfo      // available backends (filtered, non-hidden)
+	rcloneFilteredList       []*fs.RegInfo      // backends filtered by search
+	rcloneFilter             string             // search filter text
+	selectedRemote           string             // currently selected remote for actions
+	selectedBackend          *fs.RegInfo        // backend type for new remote
+	rcloneForm               *huh.Form          // dynamic form for remote config
+	rcloneFormValues         map[string]*string // pointers to form values
+	showAdvanced             bool               // toggle for advanced options
+	advancedLoaded           bool               // true after form rebuilt with advanced options
+	advancedStartPage        int                // page index where advanced options start
+	rcloneTestResult         string             // result of rclone connection test
+
+	// OAuth state
+	oauthStatus string // status message during OAuth
+	oauthErr    error  // error from OAuth, if any
 }
 
 // expandPath expands ~ to home directory (for local file paths like SQLite)
@@ -369,7 +432,6 @@ func getPathSuggestions(partial string) []string {
 	}
 	return suggestions
 }
-
 
 // isFormDirty returns true if the user has entered any data in the form
 func (m *model) isFormDirty() bool {
@@ -708,7 +770,16 @@ func (m *model) buildAddDBForm(resetValues bool) *huh.Form {
 		WithShowErrors(true).
 		WithKeyMap(customKeyMap()).
 		WithTheme(themeAmber()).
-		WithWidth(60)
+		WithWidth(m.formWidth())
+}
+
+// formWidth returns the width for forms (terminal width - 8 for border margin + padding, min 60)
+func (m *model) formWidth() int {
+	// Border margin is 4 chars, padding is 4 chars (2 each side)
+	if m.width > 8 {
+		return m.width - 8
+	}
+	return 60 // fallback
 }
 
 // buildRestorePathForm creates a huh form for entering a local backup file path
@@ -749,7 +820,7 @@ func (m *model) buildRestorePathForm() *huh.Form {
 		WithShowErrors(true).
 		WithKeyMap(km).
 		WithTheme(themeAmber()).
-		WithWidth(60)
+		WithWidth(m.formWidth())
 }
 
 // populateFormFromDB loads values from an existing database config into form fields
@@ -820,6 +891,51 @@ func (m *model) testDestinationAccess() (bool, string) {
 }
 
 // runConnectionTestCmd returns a tea.Cmd that tests MySQL/Postgres database connection
+// runDBTestCmd runs connection and destination tests for the selected database
+func (m *model) runDBTestCmd() tea.Cmd {
+	dbName := m.editingDB
+	db := m.cfg.Databases[dbName]
+	m.testRunning = true
+
+	return func() tea.Msg {
+		// First test connection for MySQL/Postgres
+		if db.Type == "mysql" || db.Type == "postgres" {
+			if err := backup.TestConnection(db); err != nil {
+				// Send connection failure, then test destination
+				return dbTestResultMsg{testType: "connection", success: false, message: err.Error()}
+			}
+			// Connection succeeded, send result and continue to destination test
+			return dbTestResultMsg{testType: "connection", success: true, message: "Database connection successful"}
+		}
+		// For file type, skip to destination test
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		dest := expandDest(db.Dest)
+		if err := storage.TestAccess(ctx, dest); err != nil {
+			return dbTestResultMsg{testType: "destination", success: false, message: err.Error(), done: true}
+		}
+		return dbTestResultMsg{testType: "destination", success: true, message: "Destination accessible", done: true}
+	}
+}
+
+// runDBDestTestCmd runs the destination test after connection test
+func (m *model) runDBDestTestCmd() tea.Cmd {
+	dbName := m.editingDB
+	db := m.cfg.Databases[dbName]
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		dest := expandDest(db.Dest)
+		if err := storage.TestAccess(ctx, dest); err != nil {
+			return dbTestResultMsg{testType: "destination", success: false, message: err.Error(), done: true}
+		}
+		return dbTestResultMsg{testType: "destination", success: true, message: "Destination accessible", done: true}
+	}
+}
+
 func (m *model) runConnectionTestCmd() tea.Cmd {
 	if m.formData == nil {
 		return func() tea.Msg {
@@ -938,12 +1054,12 @@ func Run(cfg *config.Config) error {
 	s.Style = selectedStyle
 
 	m := model{
-		cfg:          cfg,
-		view:         viewMainMenu,
-		dbNames:      dbNames,
-		selected:     selected,
-		listPageSize: 8, // items per page in DB list
-		spinner:      s,
+		cfg:            cfg,
+		view:           viewMainMenu,
+		dbNames:        dbNames,
+		dbFilteredList: dbNames, // Initialize filtered list with all databases
+		selected:       selected,
+		spinner:        s,
 	}
 
 	p := tea.NewProgram(m)
@@ -957,6 +1073,10 @@ func (m model) Init() tea.Cmd {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		return m, nil
+
 	case tea.KeyMsg:
 		// Handle Ctrl+C globally
 		if msg.Type == tea.KeyCtrlC {
@@ -1022,6 +1142,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle confirm exit view for rclone add form
+		if m.view == viewRcloneAddFormConfirmExit {
+			switch msg.Type {
+			case tea.KeyCtrlC:
+				m.quitting = true
+				return m, tea.Quit
+			case tea.KeyUp, tea.KeyDown:
+				m.cursor = 1 - m.cursor
+				return m, nil
+			case tea.KeyEnter:
+				if m.cursor == confirmYes { // Yes, discard changes
+					// Check if we were editing or adding
+					_, wasAdding := m.rcloneFormValues["_name"]
+					if wasAdding {
+						m.view = viewRcloneAddType
+						m.cursor = 0
+					} else {
+						m.view = viewRcloneActions
+						m.cursor = 0
+					}
+					m.rcloneForm = nil
+					m.rcloneFormValues = nil
+					m.selectedBackend = nil
+					return m, nil
+				} else { // No, go back to form
+					m.view = viewRcloneAddForm
+					m.cursor = 0
+					return m, nil
+				}
+			case tea.KeyEsc:
+				m.view = viewRcloneAddForm
+				m.cursor = 0
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// Handle huh form for add database
 		if m.view == viewAddDBForm && m.addDBForm != nil {
 			if msg.Type == tea.KeyCtrlC {
@@ -1032,6 +1189,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = viewAddDBFormConfirmExit
 				m.cursor = confirmNo // Default to "No, continue editing"
 				return m, nil
+			}
+			// Ctrl+S: Save from anywhere in the form
+			if msg.String() == "ctrl+s" {
+				return m.saveNewDatabase()
 			}
 		}
 
@@ -1046,6 +1207,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor = confirmNo // Default to "No, continue editing"
 				return m, nil
 			}
+			// Ctrl+S: Save from anywhere in the form
+			if msg.String() == "ctrl+s" {
+				return m.saveEditedDatabase()
+			}
 		}
 
 		// Handle huh form for restore local path
@@ -1056,8 +1221,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle DB test view - any key returns to actions when done
+		if m.view == viewDBTest && !m.testRunning {
+			m.view = viewDBActions
+			m.cursor = dbActionTest
+			m.testConnResult = ""
+			m.testDestResult = ""
+			return m, nil
+		}
+
+		// Handle rclone test view - any key returns to actions
+		if m.view == viewRcloneTest && m.rcloneTestResult != "" {
+			m.view = viewRcloneActions
+			m.cursor = rcloneActionTest
+			return m, nil
+		}
+
+		// Handle rclone OAuth view - allow escape to cancel on error
+		if m.view == viewRcloneOAuth && m.oauthErr != nil {
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyEnter {
+				// Delete the incomplete remote and go back
+				rcloneconfig.DeleteRemote(m.selectedRemote)
+				rcloneconfig.SaveConfig()
+				m.refreshRcloneRemotes()
+				m.view = viewRcloneList
+				m.cursor = 0
+				m.selectedRemote = ""
+				m.oauthStatus = ""
+				m.oauthErr = nil
+				return m, nil
+			}
+		}
+
+		// Handle filter input for filterable list views (backspace and typing)
+		if m.isFilterableView() {
+			switch msg.Type {
+			case tea.KeyBackspace:
+				if handled, newModel := m.handleFilterBackspace(); handled {
+					return newModel, nil
+				}
+			case tea.KeyRunes:
+				return m.handleFilterInput(string(msg.Runes)), nil
+			}
+			// Fall through to generic key handling for esc/up/down/enter
+		}
+
 		// Skip generic key handling for form views - let the form handle its own keys
-		if m.view != viewAddDBForm && m.view != viewEditDBForm && m.view != viewRestoreLocalInput {
+		if m.view != viewAddDBForm && m.view != viewEditDBForm && m.view != viewRestoreLocalInput && m.view != viewRcloneAddForm {
 			switch msg.String() {
 			case "ctrl+c":
 				m.quitting = true
@@ -1073,39 +1283,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "up", "k":
 				if m.cursor > 0 {
 					m.cursor--
+				} else {
+					m.cursor = m.maxCursor() // cycle to bottom
 				}
 
 			case "down", "j":
-				m.cursor = min(m.cursor+1, m.maxCursor())
+				if m.cursor < m.maxCursor() {
+					m.cursor++
+				} else {
+					m.cursor = 0 // cycle to top
+				}
 
 			case "left", "h":
-				// Page left in DB list
-				if m.view == viewDBList && m.listPage > 0 {
-					m.listPage--
-					m.cursor = 0
+				// Previous page in retention preview
+				if m.view == viewRetentionPreConfirm && m.retentionDBPage > 0 {
+					m.retentionDBPage--
 				}
 
 			case "right", "l":
-				// Page right in DB list
-				if m.view == viewDBList {
-					totalPages := (len(m.dbNames) + m.listPageSize - 1) / m.listPageSize
-					if m.listPage < totalPages-1 {
-						m.listPage++
-						m.cursor = 0
+				// Next page in retention preview
+				if m.view == viewRetentionPreConfirm {
+					// Count DBs with files to delete
+					dbCount := 0
+					for _, name := range m.backupQueue {
+						if len(m.retentionPlan[name]) > 0 {
+							dbCount++
+						}
 					}
+					maxPage := (dbCount - 1) / 5 // 5 DBs per page
+					if m.retentionDBPage < maxPage {
+						m.retentionDBPage++
+					}
+				}
+
+			case "a":
+				// Shortcut to add new rclone remote
+				if m.view == viewRcloneList {
+					m.loadRcloneBackends()
+					m.view = viewRcloneAddType
+					m.cursor = 0
+					return m, nil
 				}
 
 			case " ":
 				// Toggle selection in backup view
 				if m.view == viewBackupSelect {
-					if m.cursor < len(m.dbNames) {
+					if m.cursor < len(m.backupFilteredList) {
 						// Toggle database selection
-						name := m.dbNames[m.cursor]
+						name := m.backupFilteredList[m.cursor]
 						m.selected[name] = !m.selected[name]
-					} else if m.cursor == len(m.dbNames) {
+					} else if m.cursor == len(m.backupFilteredList) {
 						// Toggle retention policy
 						m.skipRetention = !m.skipRetention
-					} else if m.cursor == len(m.dbNames)+1 {
+					} else if m.cursor == len(m.backupFilteredList)+1 {
 						// Toggle dry-run mode
 						m.dryRun = !m.dryRun
 					}
@@ -1127,6 +1357,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Show confirmation screen
 			m.view = viewRetentionPreConfirm
 			m.cursor = 0
+			m.retentionDBPage = 0
 			return m, nil
 		}
 		// No files to delete, start backups directly
@@ -1136,8 +1367,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleBackupStepDone(msg)
 
 	case allBackupsDoneMsg:
-		m.view = viewDone
-		m.logs = m.buildBackupSummaryLogs()
+		// Stay on viewBackupRunning to show results with scrolling
+		// User can press enter or esc to go back
 		return m, nil
 
 	case fileListMsg:
@@ -1146,6 +1377,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.err == nil {
 			m.view = viewRestoreFileSelect
 			m.cursor = 0
+			m.restoreFileFilter = ""
+			m.restoreFileFilteredList = m.backupFiles
 		}
 
 	case restoreStepDoneMsg:
@@ -1181,6 +1414,65 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m.saveEditedDatabase()
 			}
 		}
+		return m, nil
+
+	case rcloneTestResultMsg:
+		m.testRunning = false
+		if msg.success {
+			m.rcloneTestResult = successStyle.Render("✓ " + msg.message)
+		} else {
+			m.rcloneTestResult = errorStyle.Render("✗ " + msg.message)
+		}
+		// Stay in current view showing the result
+		return m, nil
+
+	case dbTestResultMsg:
+		if msg.success {
+			if msg.testType == "connection" {
+				m.testConnResult = successStyle.Render("✓ " + msg.message)
+			} else {
+				m.testDestResult = successStyle.Render("✓ " + msg.message)
+			}
+		} else {
+			if msg.testType == "connection" {
+				m.testConnResult = errorStyle.Render("✗ " + msg.message)
+			} else {
+				m.testDestResult = errorStyle.Render("✗ " + msg.message)
+			}
+		}
+		// If connection test done, continue with destination test
+		if msg.testType == "connection" && !msg.done {
+			return m, m.runDBDestTestCmd()
+		}
+		// All tests done, stay in test view to show results
+		m.testRunning = false
+		return m, nil
+
+	case oauthCompleteMsg:
+		if msg.err != nil {
+			m.oauthErr = msg.err
+			m.oauthStatus = "Authentication failed"
+			// Stay in OAuth view to show error
+			return m, nil
+		}
+
+		// OAuth succeeded
+		rcloneconfig.SaveConfig()
+		m.refreshRcloneRemotes()
+
+		if msg.isEdit {
+			m.view = viewRcloneActions
+			m.cursor = 0
+		} else {
+			m.view = viewRcloneList
+			m.cursor = 0
+			m.selectedRemote = ""
+		}
+		m.rcloneForm = nil
+		m.rcloneFormValues = nil
+		m.selectedBackend = nil
+		m.oauthStatus = ""
+		m.oauthErr = nil
 		return m, nil
 	}
 
@@ -1340,6 +1632,75 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	// Update rclone form if active
+	if m.view == viewRcloneAddForm && m.rcloneForm != nil {
+		// Handle special keys before form consumes them
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			if keyMsg.Type == tea.KeyCtrlC {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			if keyMsg.Type == tea.KeyEsc {
+				m.view = viewRcloneAddFormConfirmExit
+				m.cursor = confirmNo // Default to "No, continue editing"
+				return m, nil
+			}
+			// Ctrl+S: Save from anywhere in the form
+			if keyMsg.String() == "ctrl+s" {
+				return m.saveRcloneRemote()
+			}
+			// Ctrl+T: Test the remote configuration
+			if keyMsg.String() == "ctrl+t" && !m.testRunning {
+				m.testRunning = true
+				m.rcloneTestResult = ""
+				return m, tea.Batch(m.spinner.Tick, m.runRcloneFormTestCmd())
+			}
+		}
+
+		form, cmd := m.rcloneForm.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.rcloneForm = f
+		}
+
+		// Check if form completed
+		if m.rcloneForm.State == huh.StateCompleted {
+			// Check if user selected "Show advanced options"
+			showAdvPtr := m.rcloneFormValues["_show_advanced"]
+			wantsAdvanced := showAdvPtr != nil && *showAdvPtr == "yes"
+
+			// If user selected "Show advanced options" and we haven't loaded them yet, rebuild form
+			if wantsAdvanced && !m.advancedLoaded {
+				// Collect existing values to preserve them when rebuilding
+				existingValues := make(map[string]string)
+				for k, v := range m.rcloneFormValues {
+					if v != nil && !strings.HasPrefix(k, "_") {
+						existingValues[k] = *v
+					}
+				}
+				// Rebuild form with advanced options
+				m.showAdvanced = true
+				m.advancedLoaded = true
+				m.rcloneForm = m.buildRcloneForm(existingValues)
+				// Jump to the first advanced options page
+				cmds := []tea.Cmd{m.rcloneForm.Init()}
+				for i := 0; i < m.advancedStartPage; i++ {
+					cmds = append(cmds, m.rcloneForm.NextGroup())
+				}
+				return m, tea.Batch(cmds...)
+			}
+			return m.saveRcloneRemote()
+		}
+
+		// Check if form aborted
+		if m.rcloneForm.State == huh.StateAborted {
+			m.view = viewRcloneAddFormConfirmExit
+			m.cursor = confirmNo
+			return m, nil
+		}
+
+		return m, cmd
+	}
+
 	// Update restore path form if active
 	if m.view == viewRestoreLocalInput && m.restorePathForm != nil {
 		// Handle Esc before form consumes it
@@ -1423,6 +1784,56 @@ func (m model) goBack() model {
 	case viewDeleteConfirm:
 		m.view = viewDBActions
 		m.cursor = 0
+	case viewDBTest:
+		m.view = viewDBActions
+		m.cursor = dbActionTest
+		m.testConnResult = ""
+		m.testDestResult = ""
+		m.testRunning = false
+	case viewRcloneList:
+		m.view = viewMainMenu
+		m.cursor = menuManageRclone
+		m.rcloneRemoteFilter = ""
+		m.rcloneRemoteFilteredList = m.rcloneRemotes
+	case viewRcloneActions:
+		m.view = viewRcloneList
+		m.cursor = 0
+		m.selectedRemote = ""
+		m.rcloneRemoteFilter = ""
+		m.rcloneRemoteFilteredList = m.rcloneRemotes
+	case viewRcloneAddType:
+		m.view = viewRcloneList
+		m.cursor = len(m.rcloneRemoteFilteredList) // back to Add button
+		m.rcloneFilter = ""
+		m.rcloneFilteredList = m.rcloneBackends
+		m.rcloneRemoteFilter = ""
+		m.rcloneRemoteFilteredList = m.rcloneRemotes
+	case viewRcloneAddForm:
+		// Check if we were editing or adding
+		_, wasAdding := m.rcloneFormValues["_name"]
+		if wasAdding {
+			m.view = viewRcloneAddType
+			m.cursor = 0
+		} else {
+			m.view = viewRcloneActions
+			m.cursor = rcloneActionEdit
+		}
+		m.rcloneForm = nil
+		m.rcloneFormValues = nil
+		m.selectedBackend = nil
+		m.showAdvanced = false
+		m.advancedLoaded = false
+	case viewRcloneDeleteConfirm:
+		m.view = viewRcloneActions
+		m.cursor = rcloneActionDelete
+	case viewRcloneTest:
+		m.view = viewRcloneActions
+		m.cursor = rcloneActionTest
+		m.rcloneTestResult = ""
+	case viewRcloneOAuth:
+		m.view = viewRcloneAddForm
+		m.oauthStatus = ""
+		m.oauthErr = nil
 	}
 	return m
 }
@@ -1439,6 +1850,8 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			}
 			m.view = viewBackupSelect
 			m.cursor = 0
+			m.backupFilter = ""
+			m.backupFilteredList = m.dbNames
 		case menuRestore:
 			if len(m.dbNames) == 0 {
 				m.err = fmt.Errorf("no databases configured")
@@ -1447,9 +1860,17 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			}
 			m.view = viewRestoreDBSelect
 			m.cursor = 0
+			m.restoreDBFilter = ""
+			m.restoreDBFilteredList = m.dbNames
 		case menuManage:
 			m.view = viewDBList
 			m.cursor = 0
+			m.dbFilter = ""
+			m.dbFilteredList = m.dbNames
+		case menuManageRclone:
+			m.view = viewRcloneList
+			m.cursor = 0
+			m.refreshRcloneRemotes()
 		case menuExit:
 			m.quitting = true
 			return m, tea.Quit
@@ -1463,9 +1884,9 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		return m, m.addDBForm.Init()
 
 	case viewBackupSelect:
-		// Run Backup is after databases, retention toggle, and dry-run toggle
-		if m.cursor == len(m.dbNames)+2 {
-			// Build ordered queue of selected databases
+		// Run Backup is after filtered databases, retention toggle, and dry-run toggle
+		if m.cursor == len(m.backupFilteredList)+2 {
+			// Build ordered queue of selected databases (from ALL databases, not just filtered)
 			m.backupQueue = nil
 			for _, name := range m.dbNames {
 				if m.selected[name] {
@@ -1477,6 +1898,9 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 				m.view = viewDone
 				return m, nil
 			}
+
+			// Reset cursor for backup running view
+			m.cursor = 0
 
 			// Skip retention pre-check if dry-run or skip-retention is enabled
 			if m.dryRun || m.skipRetention {
@@ -1505,8 +1929,8 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		}
 
 	case viewRestoreDBSelect:
-		if m.cursor < len(m.dbNames) {
-			m.selectedDB = m.dbNames[m.cursor]
+		if m.cursor < len(m.restoreDBFilteredList) {
+			m.selectedDB = m.restoreDBFilteredList[m.cursor]
 			m.view = viewRestoreSourceSelect
 			m.cursor = 0
 		}
@@ -1527,8 +1951,8 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		}
 
 	case viewRestoreFileSelect:
-		if m.cursor < len(m.backupFiles) {
-			m.selectedFile = m.backupFiles[m.cursor].Name
+		if m.cursor < len(m.restoreFileFilteredList) {
+			m.selectedFile = m.restoreFileFilteredList[m.cursor].Name
 			m.view = viewRestoreConfirm
 			m.cursor = 0
 		}
@@ -1548,17 +1972,13 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 		}
 
 	case viewDBList:
-		// Calculate which item is selected
-		startIdx := m.listPage * m.listPageSize
-		itemsOnPage := min(len(m.dbNames)-startIdx, m.listPageSize)
-
-		if m.cursor < itemsOnPage {
-			// Selected a database
-			m.editingDB = m.dbNames[startIdx+m.cursor]
+		if m.cursor < len(m.dbFilteredList) {
+			// Selected a database from filtered list
+			m.editingDB = m.dbFilteredList[m.cursor]
 			m.view = viewDBActions
 			m.cursor = 0
 		} else {
-			// Add new database
+			// Add new database (cursor == len(dbFilteredList))
 			m.view = viewAddDBType
 			m.cursor = 0
 		}
@@ -1570,6 +1990,11 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			m.addDBForm = m.buildAddDBForm(false)
 			m.view = viewEditDBForm
 			return m, m.addDBForm.Init()
+		case dbActionTest:
+			m.view = viewDBTest
+			m.testConnResult = ""
+			m.testDestResult = ""
+			return m, m.runDBTestCmd()
 		case dbActionDelete:
 			m.view = viewDeleteConfirm
 			m.cursor = confirmNo // Default to "No, go back"
@@ -1596,6 +2021,83 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			return m.startBackups()
 		}
 
+	case viewRcloneList:
+		if m.cursor < len(m.rcloneRemoteFilteredList) {
+			// Selected a remote from filtered list
+			m.selectedRemote = m.rcloneRemoteFilteredList[m.cursor]
+			m.view = viewRcloneActions
+			m.cursor = 0
+		} else {
+			// Add new remote
+			m.loadRcloneBackends()
+			m.view = viewRcloneAddType
+			m.cursor = 0
+		}
+
+	case viewRcloneActions:
+		switch m.cursor {
+		case rcloneActionEdit:
+			// Load existing values and build form
+			existingValues := m.loadRcloneRemoteValues(m.selectedRemote)
+			backendType := getRcloneRemoteType(m.selectedRemote)
+			backend, _ := fs.Find(backendType)
+			if backend != nil {
+				m.selectedBackend = backend
+				m.rcloneTestResult = ""
+				m.showAdvanced = false
+				m.advancedLoaded = false
+				m.rcloneForm = m.buildRcloneForm(existingValues)
+				m.view = viewRcloneAddForm
+				return m, m.rcloneForm.Init()
+			}
+		case rcloneActionTest:
+			m.view = viewRcloneTest
+			m.rcloneTestResult = ""
+			return m, m.runRcloneTestCmd()
+		case rcloneActionDelete:
+			m.view = viewRcloneDeleteConfirm
+			m.cursor = confirmNo // Default to "No, go back"
+		case rcloneActionBack:
+			m.view = viewRcloneList
+			m.cursor = 0
+			m.selectedRemote = ""
+			m.rcloneRemoteFilter = ""
+			m.rcloneRemoteFilteredList = m.rcloneRemotes
+		}
+
+	case viewRcloneAddType:
+		if len(m.rcloneFilteredList) > 0 && m.cursor < len(m.rcloneFilteredList) {
+			m.selectedBackend = m.rcloneFilteredList[m.cursor]
+			m.rcloneTestResult = ""
+			m.showAdvanced = false
+			m.advancedLoaded = false
+			m.rcloneForm = m.buildRcloneForm(nil)
+			m.view = viewRcloneAddForm
+			return m, m.rcloneForm.Init()
+		}
+
+	case viewRcloneDeleteConfirm:
+		if m.cursor == confirmYes {
+			rcloneconfig.DeleteRemote(m.selectedRemote)
+			rcloneconfig.SaveConfig()
+			m.refreshRcloneRemotes()
+			m.view = viewRcloneList
+			m.cursor = 0
+			m.selectedRemote = ""
+		} else {
+			m.view = viewRcloneActions
+			m.cursor = 0
+		}
+
+	case viewBackupRunning:
+		// If all backups done, allow enter to go back to menu
+		if m.allBackupsDone() {
+			m.view = viewMainMenu
+			m.cursor = 0
+			m.backupQueue = nil
+			m.backupStates = nil
+		}
+
 	case viewDone:
 		m.view = viewMainMenu
 		m.cursor = 0
@@ -1609,26 +2111,50 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 func (m model) maxCursor() int {
 	switch m.view {
 	case viewMainMenu:
-		return menuExit // Backup, Restore, Manage databases, Exit
+		return menuExit // Backup, Restore, Manage DBs, Manage rclone, Exit
 	case viewBackupSelect:
-		return len(m.dbNames) + 2 // DBs + retention toggle + dry-run toggle + Run button
+		// Filtered DBs + retention toggle + dry-run toggle + Run button
+		return len(m.backupFilteredList) + 2
 	case viewRestoreDBSelect:
-		return len(m.dbNames) - 1
+		// Filtered DBs
+		if len(m.restoreDBFilteredList) == 0 {
+			return 0
+		}
+		return len(m.restoreDBFilteredList) - 1
 	case viewRestoreSourceSelect:
 		return restoreSourceLocal // Remote or Local
 	case viewRestoreFileSelect:
-		return len(m.backupFiles) - 1
-	case viewRestoreConfirm, viewDeleteConfirm, viewRetentionPreConfirm:
+		// Filtered backup files
+		if len(m.restoreFileFilteredList) == 0 {
+			return 0
+		}
+		return len(m.restoreFileFilteredList) - 1
+	case viewRestoreConfirm, viewDeleteConfirm, viewRetentionPreConfirm, viewRcloneDeleteConfirm:
 		return confirmNo // Yes or No
 	case viewAddDBType:
 		return dbTypePostgres // file, mysql, postgres
 	case viewDBList:
-		// DBs on current page + Add button
-		startIdx := m.listPage * m.listPageSize
-		itemsOnPage := min(len(m.dbNames)-startIdx, m.listPageSize)
-		return itemsOnPage // includes Add button at position itemsOnPage
+		// Filtered DBs + Add button
+		return len(m.dbFilteredList) // Add button at position len(dbFilteredList)
 	case viewDBActions:
 		return dbActionBack // Edit, Delete, Back
+	case viewRcloneList:
+		// Filtered remotes + Add button
+		return len(m.rcloneRemoteFilteredList) // Add button at position len(filtered list)
+	case viewRcloneActions:
+		return rcloneActionBack // Edit, Test, Delete, Back
+	case viewRcloneAddType:
+		// Filtered backends list
+		if len(m.rcloneFilteredList) == 0 {
+			return 0
+		}
+		return len(m.rcloneFilteredList) - 1
+	case viewBackupRunning:
+		// Number of databases being backed up (for scroll navigation)
+		if len(m.backupQueue) == 0 {
+			return 0
+		}
+		return len(m.backupQueue) - 1
 	}
 	return 0
 }
@@ -1642,7 +2168,7 @@ func (m model) View() string {
 
 	s.WriteString(titleStyle.Render("░█▀▄░█░░░█▀█░█▀▄░█▀▄░█▀▀░█▀▄"))
 	s.WriteString("\n")
-	s.WriteString(titleStyle.Render("░█▀▄░█░░░█░█░█▀▄░█▀▄░█▀▀░█▀▄  Database Backup & Restore Tool"))
+	s.WriteString(titleStyle.Render("░█▀▄░█░░░█░█░█▀▄░█▀▄░█▀▀░█▀▄   Database Backup & Restore Tool"))
 	s.WriteString("\n")
 	s.WriteString(titleStyle.Render("░▀▀░░▀▀▀░▀▀▀░▀▀░░▀▀░░▀▀▀░▀░▀"))
 	s.WriteString("\n\n")
@@ -1770,6 +2296,24 @@ func (m model) View() string {
 		}
 	case viewDeleteConfirm:
 		s.WriteString(m.renderDeleteConfirm())
+	case viewDBTest:
+		s.WriteString(m.renderDBTest())
+	case viewRcloneList:
+		s.WriteString(m.renderRcloneList())
+	case viewRcloneActions:
+		s.WriteString(m.renderRcloneActions())
+	case viewRcloneAddType:
+		s.WriteString(m.renderRcloneAddType())
+	case viewRcloneAddForm:
+		s.WriteString(m.renderRcloneAddForm())
+	case viewRcloneAddFormConfirmExit:
+		s.WriteString(m.renderConfirmExit())
+	case viewRcloneDeleteConfirm:
+		s.WriteString(m.renderRcloneDeleteConfirm())
+	case viewRcloneTest:
+		s.WriteString(m.renderRcloneTest())
+	case viewRcloneOAuth:
+		s.WriteString(m.renderRcloneOAuth())
 	case viewDone:
 		s.WriteString(m.renderDone())
 	}
@@ -1779,32 +2323,65 @@ func (m model) View() string {
 	case viewMainMenu:
 		s.WriteString(dimStyle.Render("↑/↓: navigate • enter: select • esc: quit"))
 	case viewBackupSelect:
-		s.WriteString(dimStyle.Render("↑/↓: navigate • space: toggle • enter: select • esc: back"))
+		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • space: toggle • enter: run • esc: back"))
+	case viewRestoreDBSelect, viewRestoreFileSelect:
+		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • enter: select • esc: back"))
 	case viewRestoreLocalInput:
 		s.WriteString(dimStyle.Render("type path • enter: confirm • esc: back"))
 	case viewAddDBForm, viewEditDBForm:
-		s.WriteString(dimStyle.Render("↑/↓/enter: navigate • tab: complete/cycle • ctrl+t: test • esc: back"))
-	case viewAddDBFormConfirmExit, viewEditDBFormConfirmExit:
+		s.WriteString(dimStyle.Render("↑/↓/enter: navigate • tab: cycle • ctrl+s: save • ctrl+t: test • esc: back"))
+	case viewAddDBFormConfirmExit, viewEditDBFormConfirmExit, viewRcloneAddFormConfirmExit:
 		s.WriteString(dimStyle.Render("↑/↓: select • enter: confirm • esc: cancel"))
 	case viewDBList:
-		if len(m.dbNames) > m.listPageSize {
-			s.WriteString(dimStyle.Render("↑/↓: navigate • ←/→: page • enter: select • esc: back"))
-		} else {
-			s.WriteString(dimStyle.Render("↑/↓: navigate • enter: select • esc: back"))
-		}
+		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • enter: select • esc: back"))
 	case viewRetentionPreCheck:
 		s.WriteString(dimStyle.Render("Checking retention policies..."))
 	case viewRetentionPreConfirm:
-		s.WriteString(dimStyle.Render("↑/↓: select • enter: confirm • esc: back"))
-	case viewBackupRunning, viewRestoreRunning:
+		s.WriteString(dimStyle.Render("←/→: page • ↑/↓: select • enter: confirm • esc: back"))
+	case viewBackupRunning:
+		if m.allBackupsDone() {
+			s.WriteString(dimStyle.Render("↑/↓: scroll • enter: back to menu"))
+		} else {
+			s.WriteString(dimStyle.Render("↑/↓: scroll • waiting for backups to complete..."))
+		}
+	case viewRestoreRunning:
 		// No help text needed - progress is shown in main view
 	case viewDone:
 		s.WriteString(dimStyle.Render("enter: continue"))
+	case viewRcloneList:
+		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • enter: select • a: add • esc: back"))
+	case viewRcloneAddType:
+		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • enter: select • esc: back"))
+	case viewRcloneAddForm:
+		s.WriteString(dimStyle.Render("↑/↓/enter: navigate • tab: cycle • ctrl+s: save • ctrl+t: test • esc: back"))
+	case viewDBTest:
+		if !m.testRunning {
+			s.WriteString(dimStyle.Render("enter: continue"))
+		} else {
+			s.WriteString(dimStyle.Render("Testing..."))
+		}
+	case viewRcloneTest:
+		if m.rcloneTestResult != "" {
+			s.WriteString(dimStyle.Render("enter: continue"))
+		} else {
+			s.WriteString(dimStyle.Render("esc: cancel"))
+		}
+	case viewRcloneOAuth:
+		if m.oauthErr != nil {
+			s.WriteString(dimStyle.Render("enter: dismiss • esc: cancel"))
+		} else {
+			s.WriteString(dimStyle.Render("Waiting for authentication..."))
+		}
 	default:
 		s.WriteString(dimStyle.Render("↑/↓: navigate • enter: select • esc: back"))
 	}
 
-	return borderStyle.Render(s.String())
+	// Apply dynamic width to border (terminal width - 4 for safety margin, fallback to 80)
+	width := m.width - 4
+	if width < 40 {
+		width = 80
+	}
+	return borderStyle.Width(width).Render(s.String())
 }
 
 func (m model) renderMainMenu() string {
@@ -1823,7 +2400,7 @@ func (m model) renderMainMenu() string {
 
 	s.WriteString("What would you like to do?\n\n")
 
-	items := []string{"Backup databases", "Restore a database", "Manage databases", "Exit"}
+	items := []string{"Backup databases", "Restore a database", "Manage databases", "Manage rclone destinations", "Exit"}
 	for i, item := range items {
 		cursor := "  "
 		if m.cursor == i {
@@ -1840,28 +2417,67 @@ func (m model) renderBackupSelect() string {
 	var s strings.Builder
 	s.WriteString("Select databases to backup:\n\n")
 
-	for i, name := range m.dbNames {
-		cursor := "  "
-		if m.cursor == i {
-			cursor = cursorStyle.Render("▸ ")
-		}
-
-		check := "[ ]"
-		if m.selected[name] {
-			check = checkStyle.Render("[✓]")
-		}
-
-		db := m.cfg.Databases[name]
-		line := fmt.Sprintf("%s %s %s", check, name, dimStyle.Render(fmt.Sprintf("(%s)", db.Type)))
-		if m.cursor == i {
-			line = selectedStyle.Render(fmt.Sprintf("%s %s", check, name)) + " " + dimStyle.Render(fmt.Sprintf("(%s)", db.Type))
-		}
-		s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+	// Filter input
+	if m.backupFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.backupFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
 	}
 
-	// Retention toggle (index = len(dbNames))
+	if len(m.backupFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("  No matching databases found."))
+		s.WriteString("\n")
+	} else {
+		// Show databases with scrolling
+		maxVisible := 10
+		start, end := calcScrollWindow(m.cursor, len(m.backupFilteredList), maxVisible)
+
+		// Scroll indicator if there are items above
+		if start > 0 {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↑ %d more above", start)))
+			s.WriteString("\n\n")
+		}
+
+		for i := start; i < end; i++ {
+			name := m.backupFilteredList[i]
+			cursor := "  "
+			if m.cursor == i {
+				cursor = cursorStyle.Render("▸ ")
+			}
+
+			check := "[ ]"
+			if m.selected[name] {
+				check = checkStyle.Render("[✓]")
+			}
+
+			db := m.cfg.Databases[name]
+			line := fmt.Sprintf("%s %s %s", check, name, dimStyle.Render(fmt.Sprintf("(%s)", db.Type)))
+			if m.cursor == i {
+				line = selectedStyle.Render(fmt.Sprintf("%s %s", check, name)) + " " + dimStyle.Render(fmt.Sprintf("(%s)", db.Type))
+			}
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		}
+
+		// Scroll indicator if there are items below
+		if end < len(m.backupFilteredList) {
+			s.WriteString("\n")
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↓ %d more below", len(m.backupFilteredList)-end)))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.backupFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d databases", len(m.backupFilteredList), len(m.dbNames))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d databases", len(m.dbNames))))
+		}
+		s.WriteString("\n")
+	}
+
+	// Retention toggle (index = len(backupFilteredList))
 	s.WriteString("\n")
-	retentionIdx := len(m.dbNames)
+	retentionIdx := len(m.backupFilteredList)
 	cursor := "  "
 	if m.cursor == retentionIdx {
 		cursor = cursorStyle.Render("▸ ")
@@ -1876,7 +2492,7 @@ func (m model) renderBackupSelect() string {
 	}
 	s.WriteString(fmt.Sprintf("%s%s\n", cursor, retentionLabel))
 
-	// Dry-run toggle (index = len(dbNames) + 1)
+	// Dry-run toggle (index = len(backupFilteredList) + 1)
 	dryRunIdx := retentionIdx + 1
 	cursor = "  "
 	if m.cursor == dryRunIdx {
@@ -1892,7 +2508,7 @@ func (m model) renderBackupSelect() string {
 	}
 	s.WriteString(fmt.Sprintf("%s%s\n", cursor, dryRunLabel))
 
-	// Run Backup button (index = len(dbNames) + 2)
+	// Run Backup button (index = len(backupFilteredList) + 2)
 	s.WriteString("\n")
 	runLabel := "▶ Run Backup"
 	cursor = "  "
@@ -1915,28 +2531,46 @@ func (m model) renderRetentionPreCheck() string {
 func (m model) renderRetentionPreConfirm() string {
 	var s strings.Builder
 
-	// Count total files
+	// Count total files and build list of DBs with files to delete
 	totalFiles := 0
-	for _, files := range m.retentionPlan {
-		totalFiles += len(files)
+	var dbsWithFiles []string
+	for _, name := range m.backupQueue {
+		files := m.retentionPlan[name]
+		if len(files) > 0 {
+			totalFiles += len(files)
+			dbsWithFiles = append(dbsWithFiles, name)
+		}
 	}
 
 	s.WriteString(fmt.Sprintf("Retention policy will delete %d backup(s):\n\n", totalFiles))
 
-	// Show files grouped by database
+	// Calculate page bounds (5 DBs per page)
+	perPage := 5
+	totalPages := (len(dbsWithFiles) + perPage - 1) / perPage
+	start := m.retentionDBPage * perPage
+	end := start + perPage
+	if end > len(dbsWithFiles) {
+		end = len(dbsWithFiles)
+	}
+
+	// Show page indicator if there are multiple pages
+	if totalPages > 1 {
+		s.WriteString(dimStyle.Render(fmt.Sprintf("Page %d/%d", m.retentionDBPage+1, totalPages)))
+		s.WriteString("\n\n")
+	}
+
+	// Show files grouped by database (only current page)
 	maxFilesPerDB := 4
-	for _, name := range m.backupQueue {
+	for _, name := range dbsWithFiles[start:end] {
 		files := m.retentionPlan[name]
-		if len(files) == 0 {
-			continue
-		}
 
 		s.WriteString(selectedStyle.Render(name))
 		s.WriteString("\n")
 
 		for i, f := range files {
 			if i >= maxFilesPerDB {
-				s.WriteString(dimStyle.Render(fmt.Sprintf("  ... and %d more\n", len(files)-maxFilesPerDB)))
+				s.WriteString(dimStyle.Render(fmt.Sprintf("  ... and %d more", len(files)-maxFilesPerDB)))
+				s.WriteString("\n")
 				break
 			}
 			sizeStr := fmt.Sprintf("%.2f MB", float64(f.Size)/(1024*1024))
@@ -1970,39 +2604,72 @@ func (m model) renderBackupRunning() string {
 			done++
 		}
 	}
-	s.WriteString(fmt.Sprintf("Running backups (%d/%d)\n\n", done, total))
 
-	// Render each database in order with its steps
-	for i, dbName := range m.backupQueue {
+	// Header with progress
+	if done == total {
+		s.WriteString(fmt.Sprintf("Backup complete: %d / %d databases backed up\n\n", done, total))
+	} else {
+		s.WriteString(fmt.Sprintf("Running backups: %d / %d databases backed up\n\n", done, total))
+	}
+
+	// Calculate visible window (show 5 databases at a time)
+	maxVisible := 5
+	start := 0
+	if m.cursor >= maxVisible {
+		start = m.cursor - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > len(m.backupQueue) {
+		end = len(m.backupQueue)
+	}
+
+	// Scroll indicator if there are items above
+	if start > 0 {
+		s.WriteString(dimStyle.Render(fmt.Sprintf("↑ %d more above", start)))
+		s.WriteString("\n\n")
+	}
+
+	// Render visible databases
+	for i := start; i < end; i++ {
+		dbName := m.backupQueue[i]
 		state := m.backupStates[dbName]
 		if state == nil {
 			continue
 		}
 
-		// Add blank line between DBs (except first)
-		if i > 0 {
+		// Add blank line between DBs (except first visible)
+		if i > start {
 			s.WriteString("\n")
 		}
 
-		// DB name
-		s.WriteString(selectedStyle.Render(truncateString(dbName, 60)))
-		s.WriteString("\n")
+		// DB name with cursor indicator
+		cursor := "  "
+		if m.cursor == i {
+			cursor = cursorStyle.Render("▸ ")
+		}
+		s.WriteString(fmt.Sprintf("%s%s\n", cursor, selectedStyle.Render(truncateString(dbName, 60))))
 
 		// Show completed steps
 		for _, entry := range state.logs {
 			if entry.IsError {
-				s.WriteString(fmt.Sprintf("  %s %s\n", errorStyle.Render("✗"), errorStyle.Render(entry.Message)))
+				s.WriteString(fmt.Sprintf("    %s %s\n", errorStyle.Render("✗"), errorStyle.Render(entry.Message)))
 			} else if entry.IsSkipped {
-				s.WriteString(fmt.Sprintf("  %s %s\n", dimStyle.Render("○"), dimStyle.Render(entry.Message)))
+				s.WriteString(fmt.Sprintf("    %s %s\n", dimStyle.Render("○"), dimStyle.Render(entry.Message)))
 			} else {
-				s.WriteString(fmt.Sprintf("  %s %s\n", successStyle.Render("✓"), entry.Message))
+				s.WriteString(fmt.Sprintf("    %s %s\n", successStyle.Render("✓"), entry.Message))
 			}
 		}
 
 		// Show current step with spinner (if not done)
 		if !state.done && state.currentStep != stepIdle {
-			s.WriteString(fmt.Sprintf("  %s %s...\n", m.spinner.View(), state.currentStep.String()))
+			s.WriteString(fmt.Sprintf("    %s %s...\n", m.spinner.View(), state.currentStep.String()))
 		}
+	}
+
+	// Scroll indicator if there are items below
+	if end < len(m.backupQueue) {
+		s.WriteString(dimStyle.Render(fmt.Sprintf("\n  ↓ %d more below", len(m.backupQueue)-end)))
+		s.WriteString("\n")
 	}
 
 	return s.String()
@@ -2065,15 +2732,49 @@ func (m model) renderRestoreDBSelect() string {
 	var s strings.Builder
 	s.WriteString("Select database to restore:\n\n")
 
-	for i, name := range m.dbNames {
-		cursor := "  "
-		db := m.cfg.Databases[name]
-		line := fmt.Sprintf("%s %s", name, dimStyle.Render(fmt.Sprintf("(%s)", db.Type)))
-		if m.cursor == i {
-			cursor = cursorStyle.Render("▸ ")
-			line = selectedStyle.Render(name) + " " + dimStyle.Render(fmt.Sprintf("(%s)", db.Type))
+	// Filter input
+	if m.restoreDBFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.restoreDBFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
+	}
+
+	if len(m.restoreDBFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("  No matching databases found."))
+		s.WriteString("\n")
+	} else {
+		// Show databases with scrolling
+		maxVisible := 10
+		start := 0
+		if m.cursor >= maxVisible {
+			start = m.cursor - maxVisible + 1
 		}
-		s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		end := start + maxVisible
+		if end > len(m.restoreDBFilteredList) {
+			end = len(m.restoreDBFilteredList)
+		}
+
+		for i := start; i < end; i++ {
+			name := m.restoreDBFilteredList[i]
+			cursor := "  "
+			db := m.cfg.Databases[name]
+			line := fmt.Sprintf("%s %s", name, dimStyle.Render(fmt.Sprintf("(%s)", db.Type)))
+			if m.cursor == i {
+				cursor = cursorStyle.Render("▸ ")
+				line = selectedStyle.Render(name) + " " + dimStyle.Render(fmt.Sprintf("(%s)", db.Type))
+			}
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.restoreDBFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d databases", len(m.restoreDBFilteredList), len(m.dbNames))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d databases", len(m.dbNames))))
+		}
+		s.WriteString("\n")
 	}
 
 	return s.String()
@@ -2109,19 +2810,53 @@ func (m model) renderRestoreFileSelect() string {
 	var s strings.Builder
 	s.WriteString(fmt.Sprintf("Select backup to restore for %s:\n\n", selectedStyle.Render(m.selectedDB)))
 
+	// Filter input
+	if m.restoreFileFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.restoreFileFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
+	}
+
 	if len(m.backupFiles) == 0 {
 		s.WriteString(dimStyle.Render("  No backups found\n"))
 		return s.String()
 	}
 
-	for i, f := range m.backupFiles {
-		cursor := "  "
-		line := fmt.Sprintf("%s  %8.2f MB  %s", f.ModTime.Format("2006-01-02 15:04"), float64(f.Size)/(1024*1024), f.Name)
-		if m.cursor == i {
-			cursor = cursorStyle.Render("▸ ")
-			line = selectedStyle.Render(line)
+	if len(m.restoreFileFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("  No matching backups found."))
+		s.WriteString("\n")
+	} else {
+		// Show files with scrolling
+		maxVisible := 10
+		start := 0
+		if m.cursor >= maxVisible {
+			start = m.cursor - maxVisible + 1
 		}
-		s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		end := start + maxVisible
+		if end > len(m.restoreFileFilteredList) {
+			end = len(m.restoreFileFilteredList)
+		}
+
+		for i := start; i < end; i++ {
+			f := m.restoreFileFilteredList[i]
+			cursor := "  "
+			line := fmt.Sprintf("%s  %8.2f MB  %s", f.ModTime.Format("2006-01-02 15:04"), float64(f.Size)/(1024*1024), f.Name)
+			if m.cursor == i {
+				cursor = cursorStyle.Render("▸ ")
+				line = selectedStyle.Render(line)
+			}
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.restoreFileFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d backups", len(m.restoreFileFilteredList), len(m.backupFiles))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d backups", len(m.backupFiles))))
+		}
+		s.WriteString("\n")
 	}
 
 	return s.String()
@@ -2226,36 +2961,62 @@ func (m model) renderDBList() string {
 	var s strings.Builder
 	s.WriteString("Manage databases:\n\n")
 
+	// Filter input
+	if m.dbFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.dbFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
+	}
+
 	if len(m.dbNames) == 0 {
 		s.WriteString(dimStyle.Render("  No databases configured"))
 		s.WriteString("\n\n")
+	} else if len(m.dbFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("  No matching databases found."))
+		s.WriteString("\n\n")
 	} else {
-		// Calculate pagination
-		totalPages := (len(m.dbNames) + m.listPageSize - 1) / m.listPageSize
-		startIdx := m.listPage * m.listPageSize
-		endIdx := min(startIdx+m.listPageSize, len(m.dbNames))
+		// Show databases with scrolling
+		maxVisible := 10
+		start, end := calcScrollWindow(m.cursor, len(m.dbFilteredList), maxVisible)
 
-		for i := startIdx; i < endIdx; i++ {
-			name := m.dbNames[i]
+		// Scroll indicator if there are items above
+		if start > 0 {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↑ %d more above", start)))
+			s.WriteString("\n\n")
+		}
+
+		for i := start; i < end; i++ {
+			name := m.dbFilteredList[i]
 			db := m.cfg.Databases[name]
 			cursor := "  "
 			line := fmt.Sprintf("%s %s", name, dimStyle.Render(fmt.Sprintf("(%s)", db.Type)))
-			if m.cursor == i-startIdx {
+			if m.cursor == i {
 				cursor = cursorStyle.Render("▸ ")
 				line = selectedStyle.Render(name) + " " + dimStyle.Render(fmt.Sprintf("(%s)", db.Type))
 			}
 			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
 		}
 
-		// Page indicator
-		if totalPages > 1 {
-			s.WriteString(fmt.Sprintf("\n%s\n", dimStyle.Render(fmt.Sprintf("Page %d/%d (←/→ to navigate)", m.listPage+1, totalPages))))
+		// Scroll indicator if there are items below
+		if end < len(m.dbFilteredList) {
+			s.WriteString("\n")
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↓ %d more below", len(m.dbFilteredList)-end)))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.dbFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d databases", len(m.dbFilteredList), len(m.dbNames))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d databases", len(m.dbNames))))
 		}
 		s.WriteString("\n")
 	}
 
 	// Add new database option
-	addIdx := min(len(m.dbNames), m.listPageSize) // position after DBs on current page
+	s.WriteString("\n")
+	addIdx := len(m.dbFilteredList)
 	cursor := "  "
 	addLabel := "+ Add new database"
 	if m.cursor == addIdx {
@@ -2272,7 +3033,7 @@ func (m model) renderDBActions() string {
 	db := m.cfg.Databases[m.editingDB]
 	s.WriteString(fmt.Sprintf("Database: %s %s\n\n", selectedStyle.Render(m.editingDB), dimStyle.Render(fmt.Sprintf("(%s)", db.Type))))
 
-	items := []string{"Edit", "Delete", "Back"}
+	items := []string{"Edit", "Test connection", "Delete", "Back"}
 	for i, item := range items {
 		cursor := "  "
 		if m.cursor == i {
@@ -2280,6 +3041,45 @@ func (m model) renderDBActions() string {
 			item = selectedStyle.Render(item)
 		}
 		s.WriteString(fmt.Sprintf("%s%s\n", cursor, item))
+	}
+
+	return s.String()
+}
+
+func (m model) renderDBTest() string {
+	var s strings.Builder
+
+	db := m.cfg.Databases[m.editingDB]
+	s.WriteString(fmt.Sprintf("Testing %s\n\n", selectedStyle.Render(m.editingDB)))
+
+	if m.testRunning {
+		s.WriteString(m.spinner.View())
+		s.WriteString(" Testing...\n")
+	}
+
+	// Show connection test result (for mysql/postgres)
+	if db.Type == "mysql" || db.Type == "postgres" {
+		if m.testConnResult != "" {
+			s.WriteString("Connection: ")
+			s.WriteString(m.testConnResult)
+			s.WriteString("\n")
+		} else if m.testRunning {
+			s.WriteString("Connection: testing...\n")
+		}
+	}
+
+	// Show destination test result
+	if m.testDestResult != "" {
+		s.WriteString("Destination: ")
+		s.WriteString(m.testDestResult)
+		s.WriteString("\n")
+	} else if m.testRunning && m.testConnResult != "" {
+		s.WriteString("Destination: testing...\n")
+	}
+
+	if !m.testRunning {
+		s.WriteString("\n")
+		s.WriteString(dimStyle.Render("Press any key to continue"))
 	}
 
 	return s.String()
@@ -2357,6 +3157,7 @@ func (m model) saveNewDatabase() (tea.Model, tea.Cmd) {
 	m.dbNames = append(m.dbNames, m.formData.name)
 	sort.Strings(m.dbNames)
 	m.selected[m.formData.name] = true
+	m.filterDatabases(m.dbFilter) // Refresh filtered list
 
 	// Show success (include test results if available - already styled)
 	m.logs = []string{successStyle.Render(fmt.Sprintf("Database '%s' added successfully!", m.formData.name))}
@@ -2482,10 +3283,8 @@ func (m model) deleteDatabase() (tea.Model, tea.Cmd) {
 	// Remove from selected map
 	delete(m.selected, name)
 
-	// Adjust list page if needed
-	if m.listPage > 0 && len(m.dbNames) <= m.listPage*m.listPageSize {
-		m.listPage--
-	}
+	// Refresh filtered list
+	m.filterDatabases(m.dbFilter)
 
 	// Show success
 	m.logs = []string{successStyle.Render(fmt.Sprintf("Database '%s' deleted.", name))}
@@ -2525,7 +3324,7 @@ type restoreStepDoneMsg struct {
 	message   string
 	localPath string // set after download step (path to downloaded file)
 	err       error
-	done      bool   // true if restore is complete
+	done      bool // true if restore is complete
 }
 
 // testResultMsg is sent when a connection/destination test completes
@@ -2535,7 +3334,40 @@ type testResultMsg struct {
 	message  string
 }
 
+// rcloneTestResultMsg is sent when an rclone remote connection test completes
+type rcloneTestResultMsg struct {
+	success bool
+	message string
+}
+
+// dbTestResultMsg is sent when a database test completes
+type dbTestResultMsg struct {
+	testType string // "connection" or "destination"
+	success  bool
+	message  string
+	done     bool // true when all tests are complete
+}
+
+// oauthCompleteMsg is sent when OAuth authentication completes
+type oauthCompleteMsg struct {
+	err    error
+	isEdit bool
+}
+
 // Commands
+
+// allBackupsDone returns true if all backups have completed
+func (m model) allBackupsDone() bool {
+	if len(m.backupStates) == 0 {
+		return false
+	}
+	for _, state := range m.backupStates {
+		if !state.done {
+			return false
+		}
+	}
+	return true
+}
 
 // startBackups initializes and starts the backup process for all DBs in parallel
 func (m model) startBackups() (tea.Model, tea.Cmd) {
@@ -2962,4 +3794,952 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// === Rclone management views ===
+
+func (m model) renderRcloneList() string {
+	var s strings.Builder
+
+	s.WriteString("Rclone Destinations\n\n")
+
+	// Filter input
+	if m.rcloneRemoteFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.rcloneRemoteFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
+	}
+
+	if len(m.rcloneRemotes) == 0 {
+		s.WriteString(dimStyle.Render("  No rclone remotes configured."))
+		s.WriteString("\n\n")
+	} else if len(m.rcloneRemoteFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("  No matching remotes found."))
+		s.WriteString("\n\n")
+	} else {
+		// Show remotes with scrolling
+		maxVisible := 10
+		start, end := calcScrollWindow(m.cursor, len(m.rcloneRemoteFilteredList), maxVisible)
+
+		// Scroll indicator if there are items above
+		if start > 0 {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↑ %d more above", start)))
+			s.WriteString("\n\n")
+		}
+
+		for i := start; i < end; i++ {
+			name := m.rcloneRemoteFilteredList[i]
+			cursor := "  "
+			remoteType := getRcloneRemoteType(name)
+			line := fmt.Sprintf("%s %s", name, dimStyle.Render(fmt.Sprintf("(%s)", remoteType)))
+			if m.cursor == i {
+				cursor = cursorStyle.Render("▸ ")
+				line = selectedStyle.Render(name) + " " + dimStyle.Render(fmt.Sprintf("(%s)", remoteType))
+			}
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		}
+
+		// Scroll indicator if there are items below
+		if end < len(m.rcloneRemoteFilteredList) {
+			s.WriteString("\n")
+			s.WriteString(dimStyle.Render(fmt.Sprintf("↓ %d more below", len(m.rcloneRemoteFilteredList)-end)))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.rcloneRemoteFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d remotes", len(m.rcloneRemoteFilteredList), len(m.rcloneRemotes))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d remotes", len(m.rcloneRemotes))))
+		}
+		s.WriteString("\n")
+	}
+
+	// Add button
+	addIdx := len(m.rcloneRemoteFilteredList)
+	addCursor := "  "
+	addItem := "+ Add new destination"
+	if m.cursor == addIdx {
+		addCursor = cursorStyle.Render("▸ ")
+		addItem = selectedStyle.Render(addItem)
+	}
+	s.WriteString("\n")
+	s.WriteString(fmt.Sprintf("%s%s\n", addCursor, addItem))
+
+	return s.String()
+}
+
+func (m model) renderRcloneActions() string {
+	var s strings.Builder
+
+	remoteType := getRcloneRemoteType(m.selectedRemote)
+	s.WriteString(fmt.Sprintf("%s %s\n\n", selectedStyle.Render(m.selectedRemote), dimStyle.Render(fmt.Sprintf("(%s)", remoteType))))
+
+	items := []string{"Edit", "Test connection", "Delete", "Back"}
+	for i, item := range items {
+		cursor := "  "
+		if m.cursor == i {
+			cursor = cursorStyle.Render("▸ ")
+			item = selectedStyle.Render(item)
+		}
+		s.WriteString(fmt.Sprintf("%s%s\n", cursor, item))
+	}
+
+	return s.String()
+}
+
+func (m model) renderRcloneAddType() string {
+	var s strings.Builder
+
+	s.WriteString("Select Storage Type\n\n")
+
+	// Filter input
+	if m.rcloneFilter != "" {
+		s.WriteString(fmt.Sprintf("Filter: %s\n\n", selectedStyle.Render(m.rcloneFilter)))
+	} else {
+		s.WriteString(dimStyle.Render("Type to filter..."))
+		s.WriteString("\n\n")
+	}
+
+	// Show backends
+	maxVisible := 10
+	if len(m.rcloneFilteredList) == 0 {
+		s.WriteString(dimStyle.Render("No matching backends found."))
+		s.WriteString("\n")
+	} else {
+		// Calculate visible window
+		start := 0
+		if m.cursor >= maxVisible {
+			start = m.cursor - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(m.rcloneFilteredList) {
+			end = len(m.rcloneFilteredList)
+		}
+
+		for i := start; i < end; i++ {
+			ri := m.rcloneFilteredList[i]
+			cursor := "  "
+			line := fmt.Sprintf("%s %s", ri.Name, dimStyle.Render(truncateText(ri.Description, 50)))
+			if m.cursor == i {
+				cursor = cursorStyle.Render("▸ ")
+				line = selectedStyle.Render(ri.Name) + " " + dimStyle.Render(truncateText(ri.Description, 50))
+			}
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, line))
+		}
+
+		// Show count
+		s.WriteString("\n")
+		if m.rcloneFilter != "" {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("Showing %d of %d backends", len(m.rcloneFilteredList), len(m.rcloneBackends))))
+		} else {
+			s.WriteString(dimStyle.Render(fmt.Sprintf("%d backends available", len(m.rcloneBackends))))
+		}
+		s.WriteString("\n")
+	}
+
+	return s.String()
+}
+
+func (m model) renderRcloneAddForm() string {
+	var s strings.Builder
+
+	if m.selectedBackend != nil {
+		// Check if editing (no _name field in form)
+		_, isNew := m.rcloneFormValues["_name"]
+		if isNew {
+			s.WriteString(fmt.Sprintf("Configure %s remote:\n\n", selectedStyle.Render(m.selectedBackend.Name)))
+		} else {
+			s.WriteString(fmt.Sprintf("Editing %s (%s):\n\n", selectedStyle.Render(m.selectedRemote), m.selectedBackend.Name))
+		}
+
+		// Show description
+		if m.selectedBackend.Description != "" {
+			s.WriteString(dimStyle.Render(truncateText(m.selectedBackend.Description, 70)))
+			s.WriteString("\n\n")
+		}
+	}
+
+	// Show test result if available
+	if m.testRunning {
+		s.WriteString(fmt.Sprintf("%s Testing connection...\n\n", m.spinner.View()))
+	} else if m.rcloneTestResult != "" {
+		s.WriteString(m.rcloneTestResult)
+		s.WriteString("\n\n")
+	}
+
+	if m.rcloneForm != nil {
+		s.WriteString(m.rcloneForm.View())
+	}
+
+	return s.String()
+}
+
+func (m model) renderRcloneDeleteConfirm() string {
+	var s strings.Builder
+
+	s.WriteString(fmt.Sprintf("Delete rclone remote %s?\n\n", selectedStyle.Render(m.selectedRemote)))
+	s.WriteString("This cannot be undone.\n\n")
+
+	items := []string{"Yes, delete", "No, go back"}
+	for i, item := range items {
+		cursor := "  "
+		if m.cursor == i {
+			cursor = cursorStyle.Render("▸ ")
+			item = selectedStyle.Render(item)
+		}
+		s.WriteString(fmt.Sprintf("%s%s\n", cursor, item))
+	}
+
+	return s.String()
+}
+
+func (m model) renderRcloneTest() string {
+	var s strings.Builder
+
+	s.WriteString(fmt.Sprintf("Testing %s\n\n", selectedStyle.Render(m.selectedRemote)))
+
+	if m.rcloneTestResult != "" {
+		s.WriteString(m.rcloneTestResult)
+		s.WriteString("\n\n")
+		s.WriteString(dimStyle.Render("Press any key to continue"))
+	} else {
+		s.WriteString(m.spinner.View())
+		s.WriteString(" Checking connection...\n")
+	}
+
+	return s.String()
+}
+
+func (m model) renderRcloneOAuth() string {
+	var s strings.Builder
+
+	backendName := ""
+	if m.selectedBackend != nil {
+		backendName = m.selectedBackend.Name
+	}
+	s.WriteString(fmt.Sprintf("Authenticating with %s\n\n", selectedStyle.Render(backendName)))
+
+	if m.oauthErr != nil {
+		s.WriteString(errorStyle.Render("Authentication failed"))
+		s.WriteString("\n\n")
+		s.WriteString(fmt.Sprintf("Error: %v", m.oauthErr))
+		s.WriteString("\n\n")
+		s.WriteString(dimStyle.Render("Press Enter or Esc to go back"))
+	} else {
+		s.WriteString(m.spinner.View())
+		s.WriteString(" Waiting for authentication...\n\n")
+		s.WriteString(dimStyle.Render("A browser window should have opened.\n"))
+		s.WriteString(dimStyle.Render("Complete the authentication there."))
+	}
+
+	return s.String()
+}
+
+// buildRcloneForm creates a dynamic huh form based on rclone backend options
+func (m *model) buildRcloneForm(existingValues map[string]string) *huh.Form {
+	m.rcloneFormValues = make(map[string]*string)
+
+	// Build groups with names (titles added at end with page numbers)
+	type namedGroup struct {
+		name  string
+		group *huh.Group
+	}
+	var namedGroups []namedGroup
+
+	// Collect standard (non-advanced) options
+	var standardOpts []fs.Option
+	var advancedOpts []fs.Option
+	for _, opt := range m.selectedBackend.Options {
+		if opt.Hide != 0 {
+			continue
+		}
+		if opt.Advanced {
+			advancedOpts = append(advancedOpts, opt)
+		} else {
+			standardOpts = append(standardOpts, opt)
+		}
+	}
+
+	// First page: Remote name (if new) + first batch of standard options
+	var firstPageFields []huh.Field
+	isNewRemote := m.selectedRemote == "" // Adding new vs editing existing
+	if isNewRemote {
+		// Preserve existing name if we're rebuilding (e.g., for advanced options)
+		name := ""
+		if existingValues != nil {
+			if namePtr, ok := m.rcloneFormValues["_name"]; ok && namePtr != nil {
+				name = *namePtr
+			}
+		}
+		namePtr := &name
+		m.rcloneFormValues["_name"] = namePtr
+		firstPageFields = append(firstPageFields,
+			huh.NewInput().
+				Key("_name").
+				Title("Remote name").
+				Description("Identifier for this destination (no spaces)").
+				Value(namePtr).
+				Validate(func(s string) error {
+					if s == "" {
+						return fmt.Errorf("name is required")
+					}
+					if strings.Contains(s, " ") {
+						return fmt.Errorf("name cannot contain spaces")
+					}
+					for _, existing := range m.rcloneRemotes {
+						if existing == s {
+							return fmt.Errorf("remote '%s' already exists", s)
+						}
+					}
+					return nil
+				}),
+		)
+	}
+
+	// Helper to split options into pages of maxFieldsPerPage
+	const maxFieldsPerPage = 5
+	buildPages := func(opts []fs.Option, pageName string) {
+		var currentFields []huh.Field
+		pageNum := 1
+
+		for i, opt := range opts {
+			field := m.buildOptionField(opt, existingValues)
+			if field != nil {
+				currentFields = append(currentFields, field)
+			}
+
+			// Create new page when we reach limit or end of options
+			if len(currentFields) >= maxFieldsPerPage || i == len(opts)-1 {
+				if len(currentFields) > 0 {
+					name := pageName
+					if pageNum > 1 || len(opts) > maxFieldsPerPage {
+						name = fmt.Sprintf("%s (cont.)", pageName)
+					}
+					namedGroups = append(namedGroups, namedGroup{
+						name:  name,
+						group: huh.NewGroup(currentFields...),
+					})
+					currentFields = nil
+					pageNum++
+				}
+			}
+		}
+	}
+
+	// Add first batch of standard options to first page
+	firstBatchEnd := maxFieldsPerPage - len(firstPageFields)
+	if firstBatchEnd > len(standardOpts) {
+		firstBatchEnd = len(standardOpts)
+	}
+
+	for i := 0; i < firstBatchEnd; i++ {
+		field := m.buildOptionField(standardOpts[i], existingValues)
+		if field != nil {
+			firstPageFields = append(firstPageFields, field)
+		}
+	}
+
+	if len(firstPageFields) > 0 {
+		namedGroups = append(namedGroups, namedGroup{
+			name:  "Configuration",
+			group: huh.NewGroup(firstPageFields...),
+		})
+	}
+
+	// Add remaining standard options as additional pages
+	if len(standardOpts) > firstBatchEnd {
+		buildPages(standardOpts[firstBatchEnd:], "Configuration")
+	}
+
+	// Add advanced options toggle page if there are advanced options and not showing them
+	if len(advancedOpts) > 0 && !m.showAdvanced {
+		showAdvancedChoice := "no"
+		m.rcloneFormValues["_show_advanced"] = &showAdvancedChoice
+		namedGroups = append(namedGroups, namedGroup{
+			name: "Advanced Options",
+			group: huh.NewGroup(
+				huh.NewSelect[string]().
+					Key("_show_advanced").
+					Title(fmt.Sprintf("Show %d advanced options?", len(advancedOpts))).
+					Description("Advanced options are usually not needed. Use tab to change selection.").
+					Options(
+						huh.NewOption("No, save now", "no"),
+						huh.NewOption("Yes, show advanced options", "yes"),
+					).
+					Value(&showAdvancedChoice),
+			),
+		})
+	}
+
+	// Add advanced options pages if showing advanced
+	if m.showAdvanced && len(advancedOpts) > 0 {
+		// Track where advanced options start (for navigation after rebuild)
+		m.advancedStartPage = len(namedGroups)
+		buildPages(advancedOpts, "Advanced")
+	}
+
+	// Add page numbers to group titles
+	var groups []*huh.Group
+	total := len(namedGroups)
+	for i, ng := range namedGroups {
+		groups = append(groups, ng.group.Title(fmt.Sprintf("%s (%d/%d)", ng.name, i+1, total)))
+	}
+
+	return huh.NewForm(groups...).
+		WithShowHelp(true).
+		WithShowErrors(true).
+		WithKeyMap(customKeyMap()).
+		WithTheme(themeAmber()).
+		WithWidth(m.formWidth())
+}
+
+// buildOptionField creates a huh field from an fs.Option
+func (m *model) buildOptionField(opt fs.Option, existing map[string]string) huh.Field {
+	// Get existing or default value
+	val := ""
+	if existing != nil {
+		val = existing[opt.Name]
+	} else if opt.Default != nil {
+		val = fmt.Sprintf("%v", opt.Default)
+	}
+
+	// Allocate value on heap and store pointer
+	valPtr := new(string)
+	*valPtr = val
+	m.rcloneFormValues[opt.Name] = valPtr
+
+	title := opt.Name
+	if opt.Required {
+		title += " *"
+	}
+
+	// Only show first line of description to keep form compact
+	description := opt.Help
+	if idx := strings.Index(description, "\n"); idx != -1 {
+		description = description[:idx]
+	}
+
+	// Select field (has exclusive examples)
+	if len(opt.Examples) > 0 && opt.Exclusive {
+		options := make([]huh.Option[string], 0, len(opt.Examples))
+		for _, ex := range opt.Examples {
+			label := ex.Value
+			if ex.Help != "" {
+				label = fmt.Sprintf("%s - %s", ex.Value, truncateText(ex.Help, 40))
+			}
+			options = append(options, huh.NewOption(label, ex.Value))
+		}
+		return huh.NewSelect[string]().
+			Title(title).
+			Description(description).
+			Options(options...).
+			Value(valPtr)
+	}
+
+	// Boolean field (default is bool type)
+	if opt.Default != nil {
+		if _, ok := opt.Default.(bool); ok {
+			boolVal := *valPtr == "true"
+			boolPtr := &boolVal
+			// Store the conversion - we'll handle this in save
+			m.rcloneFormValues[opt.Name+"_bool"] = valPtr
+			return huh.NewConfirm().
+				Title(title).
+				Description(description).
+				Value(boolPtr)
+		}
+	}
+
+	// Password field
+	if opt.IsPassword {
+		return huh.NewInput().
+			Title(title).
+			Description(description).
+			EchoMode(huh.EchoModePassword).
+			Value(valPtr)
+	}
+
+	// Text input (with suggestions if has non-exclusive examples)
+	input := huh.NewInput().
+		Title(title).
+		Description(description).
+		Value(valPtr)
+
+	if opt.Required {
+		input = input.Validate(huh.ValidateNotEmpty())
+	}
+
+	if len(opt.Examples) > 0 && !opt.Exclusive {
+		suggestions := make([]string, 0, len(opt.Examples))
+		for _, ex := range opt.Examples {
+			suggestions = append(suggestions, ex.Value)
+		}
+		input = input.Suggestions(suggestions)
+	}
+
+	return input
+}
+
+// saveRcloneRemote saves the form values to rclone config
+func (m model) saveRcloneRemote() (tea.Model, tea.Cmd) {
+	// Determine if this is a new remote or editing existing
+	var name string
+	isEdit := false
+	if namePtr, ok := m.rcloneFormValues["_name"]; ok && namePtr != nil {
+		name = *namePtr
+	} else {
+		// Editing existing remote
+		name = m.selectedRemote
+		isEdit = true
+	}
+
+	backendType := m.selectedBackend.Name
+
+	// Set the type first
+	rcloneconfig.FileSetValue(name, "type", backendType)
+
+	// Set all other values
+	for key, valPtr := range m.rcloneFormValues {
+		if key == "_name" || strings.HasSuffix(key, "_bool") || valPtr == nil || *valPtr == "" {
+			continue
+		}
+		rcloneconfig.FileSetValue(name, key, *valPtr)
+	}
+
+	// Check if this backend needs OAuth (has Config function)
+	if m.selectedBackend.Config != nil {
+		// Save config so PostConfig can read it
+		rcloneconfig.SaveConfig()
+
+		// Start OAuth flow
+		m.selectedRemote = name // Store name for OAuth view
+		m.view = viewRcloneOAuth
+		m.oauthStatus = "Opening browser for authentication..."
+		m.oauthErr = nil
+
+		return m, tea.Batch(m.spinner.Tick, m.runOAuthConfig(name, isEdit))
+	}
+
+	// No OAuth needed, just save
+	rcloneconfig.SaveConfig()
+
+	// Refresh remotes and return to appropriate view
+	m.refreshRcloneRemotes()
+	if isEdit {
+		m.view = viewRcloneActions
+		m.cursor = 0
+	} else {
+		m.view = viewRcloneList
+		m.cursor = 0
+		m.selectedRemote = ""
+	}
+	m.rcloneForm = nil
+	m.rcloneFormValues = nil
+	m.selectedBackend = nil
+
+	return m, nil
+}
+
+// runRcloneTestCmd runs a connection test for the selected rclone remote
+func (m *model) runRcloneTestCmd() tea.Cmd {
+	remoteName := m.selectedRemote
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err := storage.TestAccess(ctx, remoteName+":")
+		if err != nil {
+			return rcloneTestResultMsg{
+				success: false,
+				message: err.Error(),
+			}
+		}
+		return rcloneTestResultMsg{
+			success: true,
+			message: "Connection successful",
+		}
+	}
+}
+
+// runRcloneFormTestCmd tests the rclone remote using current form values
+// It temporarily saves the config, tests, and reports results
+func (m *model) runRcloneFormTestCmd() tea.Cmd {
+	backend := m.selectedBackend
+	formValues := m.rcloneFormValues
+	isEdit := m.selectedRemote != "" // Check if editing existing remote
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		// Determine remote name - use temp name to avoid modifying existing config
+		var remoteName string
+		if isEdit {
+			// For edits, use the existing remote name for testing
+			remoteName = "__test_edit_remote__"
+		} else {
+			if namePtr, ok := formValues["_name"]; ok && namePtr != nil && *namePtr != "" {
+				// Use the user's chosen name
+				remoteName = *namePtr
+			} else {
+				remoteName = "__test_temp_remote__"
+			}
+		}
+
+		// Set backend type
+		rcloneconfig.FileSetValue(remoteName, "type", backend.Name)
+
+		// Set all form values
+		for key, valPtr := range formValues {
+			if valPtr == nil || strings.HasPrefix(key, "_") {
+				continue
+			}
+			if *valPtr != "" {
+				rcloneconfig.FileSetValue(remoteName, key, *valPtr)
+			}
+		}
+
+		// Save config
+		rcloneconfig.SaveConfig()
+
+		// Test the remote
+		err := storage.TestAccess(ctx, remoteName+":")
+
+		// Clean up temp remote if we created one
+		if remoteName == "__test_temp_remote__" || remoteName == "__test_edit_remote__" {
+			rcloneconfig.DeleteRemote(remoteName)
+			rcloneconfig.SaveConfig()
+		}
+
+		if err != nil {
+			return rcloneTestResultMsg{
+				success: false,
+				message: err.Error(),
+			}
+		}
+		return rcloneTestResultMsg{
+			success: true,
+			message: "Connection successful",
+		}
+	}
+}
+
+// runOAuthConfig runs the OAuth configuration for backends that require it
+func (m *model) runOAuthConfig(remoteName string, isEdit bool) tea.Cmd {
+	backend := m.selectedBackend
+	return func() tea.Msg {
+		ctx := context.Background()
+
+		// Build a config map from the saved values
+		cm := configmap.Simple{}
+		for _, opt := range backend.Options {
+			val, ok := rcloneconfig.FileGetValue(remoteName, opt.Name)
+			if ok && val != "" {
+				cm[opt.Name] = val
+			}
+		}
+
+		// Run the backend's Config function (handles OAuth)
+		// This will open a browser for OAuth backends
+		err := rcloneconfig.PostConfig(ctx, remoteName, cm, backend)
+		if err != nil {
+			return oauthCompleteMsg{err: err, isEdit: isEdit}
+		}
+
+		return oauthCompleteMsg{err: nil, isEdit: isEdit}
+	}
+}
+
+// refreshRcloneRemotes loads the list of configured rclone remotes
+func (m *model) refreshRcloneRemotes() {
+	m.rcloneRemotes = rcloneconfig.GetRemoteNames()
+	sort.Strings(m.rcloneRemotes)
+	// Reset filter when remotes change
+	m.rcloneRemoteFilter = ""
+	m.rcloneRemoteFilteredList = m.rcloneRemotes
+}
+
+// loadRcloneRemoteValues loads all values for an existing remote
+func (m *model) loadRcloneRemoteValues(remoteName string) map[string]string {
+	values := make(map[string]string)
+
+	// Get all options from the backend
+	backendType := getRcloneRemoteType(remoteName)
+	backend, err := fs.Find(backendType)
+	if err != nil {
+		return values
+	}
+
+	// Load each option value
+	for _, opt := range backend.Options {
+		val, _ := rcloneconfig.FileGetValue(remoteName, opt.Name)
+		if val != "" {
+			values[opt.Name] = val
+		}
+	}
+
+	return values
+}
+
+// loadRcloneBackends loads the list of available rclone backends (filtered, non-hidden)
+func (m *model) loadRcloneBackends() {
+	m.rcloneBackends = nil
+	for _, ri := range fs.Registry {
+		if ri.Hide {
+			continue
+		}
+		m.rcloneBackends = append(m.rcloneBackends, ri)
+	}
+	// Sort alphabetically by name
+	sort.Slice(m.rcloneBackends, func(i, j int) bool {
+		return m.rcloneBackends[i].Name < m.rcloneBackends[j].Name
+	})
+	// Initialize filtered list to all backends
+	m.rcloneFilteredList = m.rcloneBackends
+	m.rcloneFilter = ""
+}
+
+// filterRcloneBackends filters the backend list by search term
+func (m *model) filterRcloneBackends(filter string) {
+	m.rcloneFilter = filter
+	if filter == "" {
+		m.rcloneFilteredList = m.rcloneBackends
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.rcloneFilteredList = nil
+	for _, ri := range m.rcloneBackends {
+		if strings.Contains(strings.ToLower(ri.Name), filter) ||
+			strings.Contains(strings.ToLower(ri.Description), filter) {
+			m.rcloneFilteredList = append(m.rcloneFilteredList, ri)
+		}
+	}
+}
+
+// filterDatabases filters the database list by search term (viewDBList)
+func (m *model) filterDatabases(filter string) {
+	m.dbFilter = filter
+	if filter == "" {
+		m.dbFilteredList = m.dbNames
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.dbFilteredList = nil
+	for _, name := range m.dbNames {
+		db := m.cfg.Databases[name]
+		if strings.Contains(strings.ToLower(name), filter) ||
+			strings.Contains(strings.ToLower(db.Type), filter) {
+			m.dbFilteredList = append(m.dbFilteredList, name)
+		}
+	}
+}
+
+// filterRcloneRemotes filters the rclone remote list by search term (viewRcloneList)
+func (m *model) filterRcloneRemotes(filter string) {
+	m.rcloneRemoteFilter = filter
+	if filter == "" {
+		m.rcloneRemoteFilteredList = m.rcloneRemotes
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.rcloneRemoteFilteredList = nil
+	for _, name := range m.rcloneRemotes {
+		remoteType := getRcloneRemoteType(name)
+		if strings.Contains(strings.ToLower(name), filter) ||
+			strings.Contains(strings.ToLower(remoteType), filter) {
+			m.rcloneRemoteFilteredList = append(m.rcloneRemoteFilteredList, name)
+		}
+	}
+}
+
+// filterBackupDatabases filters the backup database list by search term (viewBackupSelect)
+func (m *model) filterBackupDatabases(filter string) {
+	m.backupFilter = filter
+	if filter == "" {
+		m.backupFilteredList = m.dbNames
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.backupFilteredList = nil
+	for _, name := range m.dbNames {
+		db := m.cfg.Databases[name]
+		if strings.Contains(strings.ToLower(name), filter) ||
+			strings.Contains(strings.ToLower(db.Type), filter) {
+			m.backupFilteredList = append(m.backupFilteredList, name)
+		}
+	}
+}
+
+// filterRestoreDatabases filters the restore database list by search term (viewRestoreDBSelect)
+func (m *model) filterRestoreDatabases(filter string) {
+	m.restoreDBFilter = filter
+	if filter == "" {
+		m.restoreDBFilteredList = m.dbNames
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.restoreDBFilteredList = nil
+	for _, name := range m.dbNames {
+		db := m.cfg.Databases[name]
+		if strings.Contains(strings.ToLower(name), filter) ||
+			strings.Contains(strings.ToLower(db.Type), filter) {
+			m.restoreDBFilteredList = append(m.restoreDBFilteredList, name)
+		}
+	}
+}
+
+// filterRestoreFiles filters the backup files list by search term (viewRestoreFileSelect)
+func (m *model) filterRestoreFiles(filter string) {
+	m.restoreFileFilter = filter
+	if filter == "" {
+		m.restoreFileFilteredList = m.backupFiles
+		return
+	}
+
+	filter = strings.ToLower(filter)
+	m.restoreFileFilteredList = nil
+	for _, f := range m.backupFiles {
+		if strings.Contains(strings.ToLower(f.Name), filter) {
+			m.restoreFileFilteredList = append(m.restoreFileFilteredList, f)
+		}
+	}
+}
+
+// isFilterableView returns true if the view supports filter input
+func (m model) isFilterableView() bool {
+	switch m.view {
+	case viewRcloneAddType, viewRcloneList, viewDBList, viewBackupSelect, viewRestoreDBSelect, viewRestoreFileSelect:
+		return true
+	}
+	return false
+}
+
+// calcScrollWindow calculates the visible window for a scrollable list.
+// cursor is the current cursor position, listLen is the number of items in the list
+// (excluding any extra items like "Add" buttons), maxVisible is the max items to show.
+// Returns (start, end) indices for slicing the list.
+func calcScrollWindow(cursor, listLen, maxVisible int) (start, end int) {
+	// Cap cursor at listLen-1 for scroll calculation (handles "Add" button case)
+	scrollCursor := cursor
+	if scrollCursor >= listLen {
+		scrollCursor = listLen - 1
+	}
+	if scrollCursor < 0 {
+		scrollCursor = 0
+	}
+
+	start = 0
+	if scrollCursor >= maxVisible {
+		start = scrollCursor - maxVisible + 1
+	}
+	end = start + maxVisible
+	if end > listLen {
+		end = listLen
+	}
+	return start, end
+}
+
+// handleFilterBackspace handles backspace in filterable list views
+// Returns (handled, newModel) - handled is true if there was text to delete
+func (m model) handleFilterBackspace() (bool, model) {
+	switch m.view {
+	case viewRcloneAddType:
+		if len(m.rcloneFilter) > 0 {
+			m.rcloneFilter = m.rcloneFilter[:len(m.rcloneFilter)-1]
+			m.filterRcloneBackends(m.rcloneFilter)
+			m.cursor = 0
+			return true, m
+		}
+	case viewRcloneList:
+		if len(m.rcloneRemoteFilter) > 0 {
+			m.rcloneRemoteFilter = m.rcloneRemoteFilter[:len(m.rcloneRemoteFilter)-1]
+			m.filterRcloneRemotes(m.rcloneRemoteFilter)
+			m.cursor = 0
+			return true, m
+		}
+	case viewDBList:
+		if len(m.dbFilter) > 0 {
+			m.dbFilter = m.dbFilter[:len(m.dbFilter)-1]
+			m.filterDatabases(m.dbFilter)
+			m.cursor = 0
+			return true, m
+		}
+	case viewBackupSelect:
+		if len(m.backupFilter) > 0 {
+			m.backupFilter = m.backupFilter[:len(m.backupFilter)-1]
+			m.filterBackupDatabases(m.backupFilter)
+			m.cursor = 0
+			return true, m
+		}
+	case viewRestoreDBSelect:
+		if len(m.restoreDBFilter) > 0 {
+			m.restoreDBFilter = m.restoreDBFilter[:len(m.restoreDBFilter)-1]
+			m.filterRestoreDatabases(m.restoreDBFilter)
+			m.cursor = 0
+			return true, m
+		}
+	case viewRestoreFileSelect:
+		if len(m.restoreFileFilter) > 0 {
+			m.restoreFileFilter = m.restoreFileFilter[:len(m.restoreFileFilter)-1]
+			m.filterRestoreFiles(m.restoreFileFilter)
+			m.cursor = 0
+			return true, m
+		}
+	}
+	return false, m
+}
+
+// handleFilterInput handles text input in filterable list views
+func (m model) handleFilterInput(input string) model {
+	switch m.view {
+	case viewRcloneAddType:
+		m.rcloneFilter += input
+		m.filterRcloneBackends(m.rcloneFilter)
+		m.cursor = 0
+	case viewRcloneList:
+		m.rcloneRemoteFilter += input
+		m.filterRcloneRemotes(m.rcloneRemoteFilter)
+		m.cursor = 0
+	case viewDBList:
+		m.dbFilter += input
+		m.filterDatabases(m.dbFilter)
+		m.cursor = 0
+	case viewBackupSelect:
+		m.backupFilter += input
+		m.filterBackupDatabases(m.backupFilter)
+		m.cursor = 0
+	case viewRestoreDBSelect:
+		m.restoreDBFilter += input
+		m.filterRestoreDatabases(m.restoreDBFilter)
+		m.cursor = 0
+	case viewRestoreFileSelect:
+		m.restoreFileFilter += input
+		m.filterRestoreFiles(m.restoreFileFilter)
+		m.cursor = 0
+	}
+	return m
+}
+
+// getRcloneRemoteType returns the type of a configured remote
+func getRcloneRemoteType(name string) string {
+	t, _ := rcloneconfig.FileGetValue(name, "type")
+	return t
+}
+
+// truncateText truncates text to maxLen, adding "..." if truncated
+func truncateText(text string, maxLen int) string {
+	if len(text) <= maxLen {
+		return text
+	}
+	if maxLen <= 3 {
+		return text[:maxLen]
+	}
+	return text[:maxLen-3] + "..."
 }

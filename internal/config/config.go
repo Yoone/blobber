@@ -11,7 +11,7 @@ import (
 )
 
 type Config struct {
-	path      string                     `yaml:"-"` // not serialized
+	path      string              `yaml:"-"` // not serialized
 	Databases map[string]Database `yaml:"databases"`
 }
 

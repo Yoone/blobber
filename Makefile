@@ -1,22 +1,37 @@
-.PHONY: build run test test-integration test-all clean dev-up dev-down dev dev-clean
+.PHONY: all
+all: fmt vendor build
 
+.PHONY: fmt
+fmt:
+	go fmt ./...
+
+.PHONY: vendor
+vendor:
+	go mod tidy
+
+.PHONY: build
 build:
 	go build -o blobber .
 
+.PHONY: run
 run: build
 	./blobber
 
 # Run unit tests only
+.PHONY: test
 test:
 	go test $$(go list ./... | grep -v /integration)
 
 # Run integration tests (starts/stops Docker containers automatically)
+.PHONY: test-integration
 test-integration:
 	./integration/run-tests.sh
 
 # Run all tests
+.PHONY: test-all
 test-all: test test-integration
 
+.PHONY: clean
 clean:
 	$(RM) blobber
 	go clean
@@ -24,6 +39,7 @@ clean:
 # === Development / Manual Testing ===
 
 # Start dev containers (MySQL, MariaDB, Postgres, MinIO, Azurite)
+.PHONY: dev-up
 dev-up:
 	@echo "Starting dev containers..."
 	cd integration && docker compose up -d
@@ -50,14 +66,17 @@ dev-up:
 	@echo "Run 'make dev' to start the TUI (uses dev/rclone.conf automatically)"
 
 # Stop dev containers
+.PHONY: dev-down
 dev-down:
 	@echo "Stopping dev containers..."
 	cd integration && docker compose down --remove-orphans
 
 # Run blobber TUI with dev config
+.PHONY: dev
 dev: build
 	./blobber -c dev/blobber-dev.yaml --rclone-config dev/rclone.conf
 
 # Clean dev data (backups and SQLite)
+.PHONY: dev-clean
 dev-clean:
 	rm -rf dev/backups dev/test.db

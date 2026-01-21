@@ -216,10 +216,10 @@ func TestApplyMaxSize(t *testing.T) {
 	ctx := context.Background()
 
 	files := []storage.RemoteFile{
-		{Name: "mydb_20240115_150000.sql.gz", Size: 5 * 1024 * 1024},  // 5MB
-		{Name: "mydb_20240115_140000.sql.gz", Size: 5 * 1024 * 1024},  // 5MB
-		{Name: "mydb_20240115_130000.sql.gz", Size: 5 * 1024 * 1024},  // 5MB
-		{Name: "mydb_20240115_120000.sql.gz", Size: 5 * 1024 * 1024},  // 5MB
+		{Name: "mydb_20240115_150000.sql.gz", Size: 5 * 1024 * 1024}, // 5MB
+		{Name: "mydb_20240115_140000.sql.gz", Size: 5 * 1024 * 1024}, // 5MB
+		{Name: "mydb_20240115_130000.sql.gz", Size: 5 * 1024 * 1024}, // 5MB
+		{Name: "mydb_20240115_120000.sql.gz", Size: 5 * 1024 * 1024}, // 5MB
 	}
 
 	t.Run("max 12MB keeps 2", func(t *testing.T) {

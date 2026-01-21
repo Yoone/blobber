@@ -1,0 +1,143 @@
+databases:
+  mariadb-local:
+    type: mysql
+    host: 127.0.0.1
+    port: 3307
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: /Users/yoone/projects/backup-script/dev/backups/mariadb
+    compression: zstd
+    retention:
+      keep_last: 5
+  mysql-azure:
+    type: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: azurite:backups-mysql
+    compression: gz
+    retention:
+      keep_last: 3
+  mysql-local:
+    type: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: dev/backups/mysql
+    compression: gz
+    retention:
+      keep_last: 5
+  mysql-s3:
+    type: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: minio:backups-mysql
+    compression: gz
+    retention:
+      keep_last: 3
+  postgres-azure:
+    type: postgres
+    host: 127.0.0.1
+    port: 5432
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: azurite:backups-postgres
+    compression: zstd
+    retention:
+      keep_last: 3
+  postgres-local:
+    type: postgres
+    host: 127.0.0.1
+    port: 5432
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: dev/backups/postgres
+    compression: none
+    retention:
+      keep_last: 5
+  postgres-s3:
+    type: postgres
+    host: 127.0.0.1
+    port: 5432
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: minio:backups-postgres
+    compression: zstd
+    retention:
+      keep_last: 3
+  sqlite-local:
+    type: file
+    path: dev/test.db
+    dest: dev/backups/sqlite
+    compression: gz
+    retention:
+      keep_last: 5
+  sqlite-s3:
+    type: file
+    path: dev/test.db
+    dest: minio:backups-sqlite
+    compression: gz
+    retention:
+      keep_last: 3
+  sqlite-azure:
+    type: file
+    path: dev/test.db
+    dest: azurite:backups-sqlite
+    compression: zstd
+    retention:
+      keep_last: 3
+  mariadb-s3:
+    type: mysql
+    host: 127.0.0.1
+    port: 3307
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: minio:backups-mariadb
+    compression: gz
+    retention:
+      keep_last: 3
+  mariadb-azure:
+    type: mysql
+    host: 127.0.0.1
+    port: 3307
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: azurite:backups-mariadb
+    compression: zstd
+    retention:
+      keep_last: 3
+  mysql-local-2:
+    type: mysql
+    host: 127.0.0.1
+    port: 3306
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: dev/backups/mysql2
+    compression: zstd
+    retention:
+      keep_last: 5
+  postgres-local-2:
+    type: postgres
+    host: 127.0.0.1
+    port: 5432
+    user: testuser
+    password: testpass
+    database: testdb
+    dest: dev/backups/postgres2
+    compression: gz
+    retention:
+      keep_last: 5

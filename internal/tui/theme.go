@@ -5,11 +5,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const (
-	// Total width including borders and padding
-	tuiWidth = 80
-)
-
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
@@ -18,11 +13,10 @@ var (
 	dimStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	errorStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	successStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
-	borderStyle = lipgloss.NewStyle().
+	borderStyle   = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("208")).
-			Padding(1, 2).
-			Width(tuiWidth)
+			Padding(1, 2)
 )
 
 // themeAmber returns a custom huh theme with orange/purple/green colors

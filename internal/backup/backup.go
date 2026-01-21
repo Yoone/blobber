@@ -249,8 +249,8 @@ func dumpPostgres(db config.Database, outPath string) error {
 		"-h", db.Host,
 		"-p", fmt.Sprintf("%d", db.Port),
 		"-U", db.User,
-		"--clean",      // Include DROP statements for clean restore
-		"--if-exists",  // Don't error if objects don't exist
+		"--clean",     // Include DROP statements for clean restore
+		"--if-exists", // Don't error if objects don't exist
 		db.Database,
 	}
 
