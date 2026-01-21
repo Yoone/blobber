@@ -211,9 +211,8 @@ blobber restore --local mydb /path/to/local/backup.sql.gz   # From local file
 
 ## Development
 
-### Prerequisites
+### Additional Prerequisites
 
-- Go 1.21+
 - Docker and Docker Compose
 - sqlite3 CLI
 
