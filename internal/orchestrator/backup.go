@@ -105,7 +105,7 @@ func RunBackups(ctx context.Context, cfg *config.Config, databases []string, opt
 		wg.Add(1)
 		go func(idx int, dbName string) {
 			defer wg.Done()
-			result := runSingleBackup(ctx, cfg, dbName, opts, retentionPlan[dbName], progress)
+			result := runSingleBackup(ctx, cfg, dbName, opts, progress)
 			resultsMu.Lock()
 			results[idx] = result
 			resultsMu.Unlock()
@@ -117,7 +117,7 @@ func RunBackups(ctx context.Context, cfg *config.Config, databases []string, opt
 }
 
 // runSingleBackup executes all backup steps for a single database
-func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts BackupOptions, retentionFiles []storage.RemoteFile, progress chan<- BackupProgress) BackupResult {
+func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts BackupOptions, progress chan<- BackupProgress) BackupResult {
 	db := cfg.Databases[name]
 	result := BackupResult{DBName: name, Success: true}
 
@@ -161,28 +161,40 @@ func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts 
 	}
 
 	// Step 3: Retention
+	// Re-calculate retention after upload to include the new file
 	if opts.DryRun {
 		progress <- BackupProgress{DBName: name, Step: StepRetention, Message: "Retention skipped (dry-run)", Skipped: true, Done: true}
 		result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: "Retention skipped (dry-run)", Skipped: true})
 	} else if opts.SkipRetention {
 		progress <- BackupProgress{DBName: name, Step: StepRetention, Message: "Skipped (--skip-retention)", Skipped: true, Done: true}
 		result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: "Skipped (--skip-retention)", Skipped: true})
-	} else if len(retentionFiles) > 0 {
+	} else if db.Retention.KeepLast > 0 || db.Retention.KeepDays > 0 || db.Retention.MaxSizeMB > 0 {
 		progress <- BackupProgress{DBName: name, Step: StepRetention}
 
-		var deleted int
-		for _, f := range retentionFiles {
-			if err := storage.Delete(ctx, db.Dest, f.Name); err == nil {
-				deleted++
-			}
+		// Re-fetch files after upload to get accurate count including new backup
+		files, err := storage.List(ctx, db.Dest)
+		if err != nil {
+			progress <- BackupProgress{DBName: name, Step: StepRetention, Error: err, Done: true}
+			result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Error: err})
+			result.Error = err
+			return result
 		}
 
-		msg := fmt.Sprintf("Deleted %d old backup(s)", deleted)
-		progress <- BackupProgress{DBName: name, Step: StepRetention, Message: msg, Done: true}
-		result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: msg})
-	} else if db.Retention.KeepLast > 0 || db.Retention.KeepDays > 0 || db.Retention.MaxSizeMB > 0 {
-		progress <- BackupProgress{DBName: name, Step: StepRetention, Message: "No old backups to delete", Skipped: true, Done: true}
-		result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: "No old backups to delete", Skipped: true})
+		toDelete := retention.Apply(ctx, files, name, db.Retention)
+		if len(toDelete) > 0 {
+			var deleted int
+			for _, f := range toDelete {
+				if err := storage.Delete(ctx, db.Dest, f.Name); err == nil {
+					deleted++
+				}
+			}
+			msg := fmt.Sprintf("Deleted %d old backup(s)", deleted)
+			progress <- BackupProgress{DBName: name, Step: StepRetention, Message: msg, Done: true}
+			result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: msg})
+		} else {
+			progress <- BackupProgress{DBName: name, Step: StepRetention, Message: "No old backups to delete", Skipped: true, Done: true}
+			result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: "No old backups to delete", Skipped: true})
+		}
 	} else {
 		progress <- BackupProgress{DBName: name, Step: StepRetention, Message: "No retention policy", Skipped: true, Done: true}
 		result.Steps = append(result.Steps, BackupProgress{DBName: name, Step: StepRetention, Message: "No retention policy", Skipped: true})

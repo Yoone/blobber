@@ -232,3 +232,48 @@ func TestApplyMaxSize(t *testing.T) {
 		}
 	})
 }
+
+func TestApplyCombinedRules(t *testing.T) {
+	ctx := context.Background()
+
+	// Create files with timestamps relative to now
+	now := time.Now()
+	files := []storage.RemoteFile{
+		{Name: "mydb_" + now.Format("20060102_150405") + ".sql.gz", Size: 1024 * 1024},                         // today, 1MB
+		{Name: "mydb_" + now.AddDate(0, 0, -1).Format("20060102_150405") + ".sql.gz", Size: 1024 * 1024},       // 1 day ago, 1MB
+		{Name: "mydb_" + now.AddDate(0, 0, -2).Format("20060102_150405") + ".sql.gz", Size: 1024 * 1024},       // 2 days ago, 1MB
+		{Name: "mydb_" + now.AddDate(0, 0, -5).Format("20060102_150405") + ".sql.gz", Size: 1024 * 1024},       // 5 days ago, 1MB
+		{Name: "mydb_" + now.AddDate(0, 0, -10).Format("20060102_150405") + ".sql.gz", Size: 10 * 1024 * 1024}, // 10 days ago, 10MB
+	}
+
+	t.Run("combined keep_last and keep_days", func(t *testing.T) {
+		// keep_last: 3 would delete files 4 and 5 (5 days and 10 days old)
+		// keep_days: 7 would delete file 5 (10 days old)
+		// Combined: should delete files 4 and 5
+		ret := config.Retention{KeepLast: 3, KeepDays: 7}
+		toDelete := Apply(ctx, files, "mydb", ret)
+		if len(toDelete) != 2 {
+			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
+		}
+	})
+
+	t.Run("combined all three rules", func(t *testing.T) {
+		// keep_last: 4 would delete file 5 (10 days old)
+		// keep_days: 3 would delete files 4 and 5 (5 and 10 days old)
+		// max_size_mb: 5 would delete file 5 (cumulative 14MB > 5MB)
+		// Combined: should delete files 4 and 5 (union of all rules)
+		ret := config.Retention{KeepLast: 4, KeepDays: 3, MaxSizeMB: 5}
+		toDelete := Apply(ctx, files, "mydb", ret)
+		if len(toDelete) != 2 {
+			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
+		}
+	})
+
+	t.Run("no rules configured", func(t *testing.T) {
+		ret := config.Retention{}
+		toDelete := Apply(ctx, files, "mydb", ret)
+		if len(toDelete) != 0 {
+			t.Fatalf("expected 0 to delete when no rules, got %d", len(toDelete))
+		}
+	})
+}

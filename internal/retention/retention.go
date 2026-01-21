@@ -73,6 +73,7 @@ func filterByName(files []storage.RemoteFile, dbName string) []backupFile {
 
 // Apply applies the retention policy and returns files to delete.
 // Only considers files matching the database name and naming convention.
+// Multiple retention rules can be combined - a file is deleted if ANY rule marks it for deletion.
 func Apply(ctx context.Context, files []storage.RemoteFile, dbName string, retention config.Retention) []storage.RemoteFile {
 	if len(files) == 0 {
 		return nil
@@ -84,21 +85,30 @@ func Apply(ctx context.Context, files []storage.RemoteFile, dbName string, reten
 		return nil
 	}
 
-	var toDelete []backupFile
+	// Track files to delete using a map to avoid duplicates
+	toDeleteMap := make(map[string]backupFile)
 
-	switch {
-	case retention.KeepLast > 0:
-		toDelete = applyKeepLast(filtered, retention.KeepLast)
-	case retention.KeepDays > 0:
-		toDelete = applyKeepDays(filtered, retention.KeepDays)
-	case retention.MaxSizeMB > 0:
-		toDelete = applyMaxSize(filtered, retention.MaxSizeMB)
+	// Apply all configured rules - files are deleted if ANY rule says to delete
+	if retention.KeepLast > 0 {
+		for _, f := range applyKeepLast(filtered, retention.KeepLast) {
+			toDeleteMap[f.Name] = f
+		}
+	}
+	if retention.KeepDays > 0 {
+		for _, f := range applyKeepDays(filtered, retention.KeepDays) {
+			toDeleteMap[f.Name] = f
+		}
+	}
+	if retention.MaxSizeMB > 0 {
+		for _, f := range applyMaxSize(filtered, retention.MaxSizeMB) {
+			toDeleteMap[f.Name] = f
+		}
 	}
 
-	// Convert back to RemoteFile slice
-	result := make([]storage.RemoteFile, len(toDelete))
-	for i, f := range toDelete {
-		result[i] = f.RemoteFile
+	// Convert map to slice
+	result := make([]storage.RemoteFile, 0, len(toDeleteMap))
+	for _, f := range toDeleteMap {
+		result = append(result, f.RemoteFile)
 	}
 	return result
 }
