@@ -6,7 +6,7 @@ databases:
     user: testuser
     password: testpass
     database: testdb
-    dest: /Users/yoone/projects/backup-script/dev/backups/mariadb
+    dest: dev/backups/mariadb
     compression: zstd
     retention:
       keep_last: 5
