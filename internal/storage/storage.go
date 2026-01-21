@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -12,6 +13,7 @@ import (
 
 	_ "github.com/rclone/rclone/backend/all"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/operations"
@@ -25,6 +27,15 @@ type RemoteFile struct {
 	ModTime time.Time
 }
 
+// TransferProgress represents the progress of a file transfer
+type TransferProgress struct {
+	BytesDone  int64   // bytes transferred so far
+	BytesTotal int64   // total bytes to transfer
+	Speed      float64 // transfer speed in bytes/second
+	Done       bool    // true when transfer is complete
+	Error      error   // error if transfer failed
+}
+
 var initOnce sync.Once
 
 // Init initializes the rclone storage backend.
@@ -32,6 +43,13 @@ var initOnce sync.Once
 // This function is safe to call multiple times; only the first call has effect.
 func Init(configPath string) {
 	initOnce.Do(func() {
+		// Disable bucket creation for S3-like backends
+		// This prevents "CreateBucket: Access Denied" errors when the bucket already exists
+		// but the user doesn't have CreateBucket permission
+		os.Setenv("RCLONE_S3_NO_CHECK_BUCKET", "true")
+		os.Setenv("RCLONE_GCS_NO_CHECK_BUCKET", "true")       // Google Cloud Storage
+		os.Setenv("RCLONE_AZUREBLOB_NO_CHECK_CONTAINER", "true") // Azure Blob
+
 		// Set custom config path if provided
 		if configPath != "" {
 			config.SetConfigPath(configPath)
@@ -81,6 +99,103 @@ func Upload(ctx context.Context, localPath, remoteDest string) error {
 	}
 
 	return nil
+}
+
+// UploadWithProgress uploads a file and reports progress via the provided channel.
+// Progress updates are sent periodically until the upload completes.
+// The channel is closed when the upload finishes (successfully or with error).
+func UploadWithProgress(ctx context.Context, localPath, remoteDest string, fileSize int64, progressCh chan<- TransferProgress) {
+	defer close(progressCh)
+
+	// Reset stats before starting
+	stats := accounting.GlobalStats()
+	stats.ResetCounters()
+
+	// Create fs for local directory containing the file
+	localDir := filepath.Dir(localPath)
+	fileName := filepath.Base(localPath)
+
+	fsrc, err := fs.NewFs(ctx, localDir)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("parsing local path: %w", err), Done: true}
+		return
+	}
+
+	fdst, err := fs.NewFs(ctx, remoteDest)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("parsing remote destination: %w", err), Done: true}
+		return
+	}
+
+	// Get the source file object
+	srcObj, err := fsrc.NewObject(ctx, fileName)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("getting source object: %w", err), Done: true}
+		return
+	}
+
+	// Start progress monitoring in a goroutine
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				rs, err := stats.RemoteStats(false)
+				if err != nil {
+					continue
+				}
+
+				var bytesDone int64
+				var speed float64
+
+				// Get bytes from stats
+				if b, ok := rs["bytes"].(int64); ok {
+					bytesDone = b
+				}
+				if s, ok := rs["speed"].(float64); ok {
+					speed = s
+				}
+
+				// Send progress update
+				select {
+				case progressCh <- TransferProgress{
+					BytesDone:  bytesDone,
+					BytesTotal: fileSize,
+					Speed:      speed,
+				}:
+				default:
+					// Skip if channel is full
+				}
+			}
+		}
+	}()
+
+	// Perform the upload
+	_, err = operations.Copy(ctx, fdst, nil, srcObj.Remote(), srcObj)
+	close(done)
+
+	if err != nil {
+		progressCh <- TransferProgress{
+			BytesDone:  fileSize,
+			BytesTotal: fileSize,
+			Error:      fmt.Errorf("uploading file: %w", err),
+			Done:       true,
+		}
+		return
+	}
+
+	// Send final progress
+	progressCh <- TransferProgress{
+		BytesDone:  fileSize,
+		BytesTotal: fileSize,
+		Speed:      0,
+		Done:       true,
+	}
 }
 
 // List lists files at the remote destination
@@ -140,6 +255,99 @@ func Download(ctx context.Context, remoteDest, fileName, localPath string) error
 	}
 
 	return nil
+}
+
+// DownloadWithProgress downloads a file and reports progress via the provided channel.
+// Progress updates are sent periodically until the download completes.
+// The channel is closed when the download finishes (successfully or with error).
+func DownloadWithProgress(ctx context.Context, remoteDest, fileName, localPath string, fileSize int64, progressCh chan<- TransferProgress) {
+	defer close(progressCh)
+
+	// Reset stats before starting
+	stats := accounting.GlobalStats()
+	stats.ResetCounters()
+
+	fsrc, err := fs.NewFs(ctx, remoteDest)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("parsing remote destination: %w", err), Done: true}
+		return
+	}
+
+	fdst, err := fs.NewFs(ctx, localPath)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("parsing local path: %w", err), Done: true}
+		return
+	}
+
+	// Get the source file object
+	srcObj, err := fsrc.NewObject(ctx, fileName)
+	if err != nil {
+		progressCh <- TransferProgress{Error: fmt.Errorf("getting remote object: %w", err), Done: true}
+		return
+	}
+
+	// Start progress monitoring in a goroutine
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				rs, err := stats.RemoteStats(false)
+				if err != nil {
+					continue
+				}
+
+				var bytesDone int64
+				var speed float64
+
+				// Get bytes from stats
+				if b, ok := rs["bytes"].(int64); ok {
+					bytesDone = b
+				}
+				if s, ok := rs["speed"].(float64); ok {
+					speed = s
+				}
+
+				// Send progress update
+				select {
+				case progressCh <- TransferProgress{
+					BytesDone:  bytesDone,
+					BytesTotal: fileSize,
+					Speed:      speed,
+				}:
+				default:
+					// Skip if channel is full
+				}
+			}
+		}
+	}()
+
+	// Perform the download
+	_, err = operations.Copy(ctx, fdst, nil, srcObj.Remote(), srcObj)
+	close(done)
+
+	if err != nil {
+		progressCh <- TransferProgress{
+			BytesDone:  fileSize,
+			BytesTotal: fileSize,
+			Error:      fmt.Errorf("downloading file: %w", err),
+			Done:       true,
+		}
+		return
+	}
+
+	// Send final progress
+	progressCh <- TransferProgress{
+		BytesDone:  fileSize,
+		BytesTotal: fileSize,
+		Speed:      0,
+		Done:       true,
+	}
 }
 
 // Delete deletes a file from remote storage

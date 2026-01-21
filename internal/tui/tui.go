@@ -17,6 +17,7 @@ import (
 	"github.com/Yoone/blobber/internal/retention"
 	"github.com/Yoone/blobber/internal/storage"
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/huh"
@@ -57,6 +58,7 @@ const (
 	viewRcloneAddForm            // Form for configuring the remote
 	viewRcloneAddFormConfirmExit // Confirm exit with unsaved changes
 	viewRcloneDeleteConfirm      // Confirm deletion
+	viewRcloneTestBucket         // Input bucket/path for testing
 	viewRcloneTest               // Testing remote connection
 	viewRcloneOAuth              // OAuth authentication in progress
 )
@@ -140,10 +142,13 @@ type backupLogEntry struct {
 
 // dbBackupState tracks the backup state for a single database
 type dbBackupState struct {
-	currentStep backupStep       // current step (stepIdle when done)
-	logs        []backupLogEntry // completed steps
-	result      *backup.Result   // result from dump step (for upload)
-	done        bool             // true when all steps complete
+	currentStep     backupStep       // current step (stepIdle when done)
+	logs            []backupLogEntry // completed steps
+	result          *backup.Result   // result from dump step (for upload)
+	done            bool             // true when all steps complete
+	uploadBytesDone int64            // bytes uploaded so far
+	uploadBytesTotal int64           // total bytes to upload
+	uploadSpeed     float64          // upload speed in bytes/second
 }
 
 // restoreStep represents the current step in the restore process
@@ -194,6 +199,26 @@ type restoreFormFields struct {
 	path string
 }
 
+// rcloneTestFormFields holds rclone test form field values in a heap-allocated struct
+type rcloneTestFormFields struct {
+	bucket string
+}
+
+// downloadState holds download state in a heap-allocated struct to survive model copies
+type downloadState struct {
+	progressCh <-chan storage.TransferProgress
+	tmpDir     string
+	fileName   string
+	fileSize   int64
+}
+
+// uploadState holds upload state in a heap-allocated struct to survive model copies
+type uploadState struct {
+	progressCh <-chan storage.TransferProgress
+	dbName     string
+	fileSize   int64
+}
+
 type model struct {
 	cfg            *config.Config
 	view           view
@@ -203,9 +228,11 @@ type model struct {
 	selected       map[string]bool // for backup multi-select
 	skipRetention  bool            // skip retention policy for this backup run
 	dryRun         bool            // perform dump but skip upload and retention
-	selectedDB     string          // for restore
-	backupFiles    []storage.RemoteFile
-	selectedFile   string
+	selectedDB          string // for restore
+	backupFiles         []storage.RemoteFile
+	backupFilesLoading  bool   // true while fetching backup files
+	selectedFile        string
+	selectedFileSize    int64  // size of selected file for restore
 	isLocalRestore bool // true if restoring from local file
 	logs           []string
 	err            error
@@ -214,14 +241,23 @@ type model struct {
 	// Spinner for progress indication
 	spinner spinner.Model
 
+	// Progress bar for downloads
+	progressBar progress.Model
+
 	// Backup progress tracking (parallel execution)
 	backupQueue  []string                  // databases to backup (in order for display)
 	backupStates map[string]*dbBackupState // per-database state
+	uploadStates map[string]*uploadState   // per-database upload state (heap-allocated for channel)
 
 	// Restore progress tracking
 	restoreStep      restoreStep       // current restore step
 	restoreLogs      []restoreLogEntry // completed restore steps
 	restoreLocalPath string            // path to local file being restored
+
+	// Download progress tracking
+	downloadBytesDone int64          // bytes downloaded so far
+	downloadSpeed     float64        // download speed in bytes/second
+	downloadState     *downloadState // heap-allocated download state (survives model copies)
 
 	// Retention plan (pre-calculated before backup starts)
 	retentionPlan map[string][]storage.RemoteFile // dbName -> files to delete
@@ -236,8 +272,8 @@ type model struct {
 	testConnResult  string // result of connection test (MySQL/Postgres page 1)
 	testDestResult  string // result of destination test (page 2)
 	formError       string // validation error to display in form
-	pendingSave     bool   // true when form completed and running pre-save tests
-	pendingDestTest bool   // true when destination test should run after connection test
+	pendingSave     bool // true when form completed and running pre-save tests
+	pendingDestTest bool // true when destination test should run after connection test
 
 	// Database list/edit/delete (viewDBList)
 	editingDB      string   // name of database being edited (empty for add)
@@ -277,10 +313,12 @@ type model struct {
 	selectedBackend          *fs.RegInfo        // backend type for new remote
 	rcloneForm               *huh.Form          // dynamic form for remote config
 	rcloneFormValues         map[string]*string // pointers to form values
-	showAdvanced             bool               // toggle for advanced options
-	advancedLoaded           bool               // true after form rebuilt with advanced options
-	advancedStartPage        int                // page index where advanced options start
-	rcloneTestResult         string             // result of rclone connection test
+	showAdvanced             bool                  // toggle for advanced options
+	advancedLoaded           bool                  // true after form rebuilt with advanced options
+	advancedStartPage        int                   // page index where advanced options start
+	rcloneTestForm           *huh.Form             // form for entering bucket to test
+	rcloneTestFormData       *rcloneTestFormFields // heap-allocated form values
+	rcloneTestResult         string                // result of rclone connection test
 
 	// OAuth state
 	oauthStatus string // status message during OAuth
@@ -823,6 +861,40 @@ func (m *model) buildRestorePathForm() *huh.Form {
 		WithWidth(m.formWidth())
 }
 
+// buildRcloneTestForm creates a huh form for entering a bucket/path to test
+func (m *model) buildRcloneTestForm() *huh.Form {
+	// Allocate on heap so pointer survives bubbletea model copies
+	if m.rcloneTestFormData == nil {
+		m.rcloneTestFormData = &rcloneTestFormFields{}
+	}
+
+	bucketInput := huh.NewInput().
+		Key("bucket").
+		Title("Bucket or container name").
+		Description("Leave empty to list all buckets (requires ListBuckets permission)").
+		Placeholder("my-bucket").
+		Value(&m.rcloneTestFormData.bucket)
+
+	return huh.NewForm(huh.NewGroup(bucketInput)).
+		WithShowHelp(true).
+		WithShowErrors(true).
+		WithTheme(themeAmber()).
+		WithWidth(m.formWidth())
+}
+
+// isS3LikeBackend checks if a backend type requires a bucket/container.
+// These backends need a bucket specified when testing, as root-level access
+// often requires ListBuckets permission which users may not have.
+func isS3LikeBackend(backendType string) bool {
+	s3LikeBackends := []string{"s3", "gcs", "azureblob", "b2", "swift", "wasabi"}
+	for _, backend := range s3LikeBackends {
+		if strings.EqualFold(backendType, backend) {
+			return true
+		}
+	}
+	return false
+}
+
 // populateFormFromDB loads values from an existing database config into form fields
 func (m *model) populateFormFromDB(name string) {
 	db := m.cfg.Databases[name]
@@ -1053,6 +1125,9 @@ func Run(cfg *config.Config) error {
 	s.Spinner = spinner.Dot
 	s.Style = selectedStyle
 
+	// Initialize progress bar
+	prog := progress.New(progress.WithDefaultGradient())
+
 	m := model{
 		cfg:            cfg,
 		view:           viewMainMenu,
@@ -1060,6 +1135,7 @@ func Run(cfg *config.Config) error {
 		dbFilteredList: dbNames, // Initialize filtered list with all databases
 		selected:       selected,
 		spinner:        s,
+		progressBar:    prog,
 	}
 
 	p := tea.NewProgram(m)
@@ -1230,10 +1306,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Handle rclone test view - any key returns to actions
+		// Handle rclone test view - any key returns to previous view
 		if m.view == viewRcloneTest && m.rcloneTestResult != "" {
-			m.view = viewRcloneActions
-			m.cursor = rcloneActionTest
+			// Return to form if we came from there, otherwise to actions menu
+			if m.rcloneForm != nil {
+				m.view = viewRcloneAddForm
+			} else {
+				m.view = viewRcloneActions
+				m.cursor = rcloneActionTest
+			}
+			m.rcloneTestResult = ""
 			return m, nil
 		}
 
@@ -1267,7 +1349,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Skip generic key handling for form views - let the form handle its own keys
-		if m.view != viewAddDBForm && m.view != viewEditDBForm && m.view != viewRestoreLocalInput && m.view != viewRcloneAddForm {
+		if m.view != viewAddDBForm && m.view != viewEditDBForm && m.view != viewRestoreLocalInput && m.view != viewRcloneAddForm && m.view != viewRcloneTestBucket {
 			switch msg.String() {
 			case "ctrl+c":
 				m.quitting = true
@@ -1372,6 +1454,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case fileListMsg:
+		m.backupFilesLoading = false
 		m.backupFiles = msg.files
 		m.err = msg.err
 		if m.err == nil {
@@ -1380,6 +1463,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.restoreFileFilter = ""
 			m.restoreFileFilteredList = m.backupFiles
 		}
+
+	case downloadProgressMsg:
+		return m.handleDownloadProgress(msg)
+
+	case uploadProgressMsg:
+		return m.handleUploadProgress(msg)
+
+	case startUploadMsg:
+		return m.startUploadWithProgress(msg.dbName, msg.backupPath, msg.dest)
 
 	case restoreStepDoneMsg:
 		return m.handleRestoreStepDone(msg)
@@ -1651,9 +1743,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Ctrl+T: Test the remote configuration
 			if keyMsg.String() == "ctrl+t" && !m.testRunning {
+				// For S3-like backends, prompt for bucket first since root-level
+				// access requires ListBuckets permission which users may not have
+				if m.selectedBackend != nil && isS3LikeBackend(m.selectedBackend.Name) {
+					m.view = viewRcloneTestBucket
+					m.rcloneTestFormData = nil
+					m.rcloneTestResult = ""
+					m.rcloneTestForm = m.buildRcloneTestForm()
+					return m, m.rcloneTestForm.Init()
+				}
 				m.testRunning = true
 				m.rcloneTestResult = ""
-				return m, tea.Batch(m.spinner.Tick, m.runRcloneFormTestCmd())
+				return m, tea.Batch(m.spinner.Tick, m.runRcloneFormTestCmd(""))
 			}
 		}
 
@@ -1718,6 +1819,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Check if form completed (validation passed)
 		if m.restorePathForm.State == huh.StateCompleted {
 			m.selectedFile = expandPath(m.restoreFormData.path)
+			if stat, err := os.Stat(m.selectedFile); err == nil {
+				m.selectedFileSize = stat.Size()
+			}
 			m.view = viewRestoreConfirm
 			m.cursor = 0
 			return m, nil
@@ -1725,6 +1829,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Check if form aborted
 		if m.restorePathForm.State == huh.StateAborted {
+			return m.goBack(), nil
+		}
+
+		return m, cmd
+	}
+
+	// Update rclone test bucket form if active
+	if m.view == viewRcloneTestBucket && m.rcloneTestForm != nil {
+		// Handle Esc before form consumes it
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			if keyMsg.Type == tea.KeyEsc {
+				return m.goBack(), nil
+			}
+		}
+
+		form, cmd := m.rcloneTestForm.Update(msg)
+		if f, ok := form.(*huh.Form); ok {
+			m.rcloneTestForm = f
+		}
+
+		// Check if form completed - start the test
+		if m.rcloneTestForm.State == huh.StateCompleted {
+			m.view = viewRcloneTest
+			bucket := ""
+			if m.rcloneTestFormData != nil {
+				bucket = m.rcloneTestFormData.bucket
+			}
+			m.rcloneTestForm = nil
+			// Use form test (with current form values) if coming from the form,
+			// otherwise use saved remote test
+			if m.rcloneForm != nil {
+				return m, m.runRcloneFormTestCmd(bucket)
+			}
+			return m, m.runRcloneTestCmd()
+		}
+
+		// Check if form aborted
+		if m.rcloneTestForm.State == huh.StateAborted {
 			return m.goBack(), nil
 		}
 
@@ -1826,9 +1968,24 @@ func (m model) goBack() model {
 	case viewRcloneDeleteConfirm:
 		m.view = viewRcloneActions
 		m.cursor = rcloneActionDelete
+	case viewRcloneTestBucket:
+		// Return to form if we came from there, otherwise to actions menu
+		if m.rcloneForm != nil {
+			m.view = viewRcloneAddForm
+		} else {
+			m.view = viewRcloneActions
+			m.cursor = rcloneActionTest
+		}
+		m.rcloneTestFormData = nil
+		m.rcloneTestForm = nil
 	case viewRcloneTest:
-		m.view = viewRcloneActions
-		m.cursor = rcloneActionTest
+		// Return to form if we came from there, otherwise to actions menu
+		if m.rcloneForm != nil {
+			m.view = viewRcloneAddForm
+		} else {
+			m.view = viewRcloneActions
+			m.cursor = rcloneActionTest
+		}
 		m.rcloneTestResult = ""
 	case viewRcloneOAuth:
 		m.view = viewRcloneAddForm
@@ -1940,7 +2097,9 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 			// From remote
 			m.isLocalRestore = false
 			m.view = viewRestoreFileSelect
-			return m, m.fetchBackupFiles()
+			m.backupFilesLoading = true
+			m.backupFiles = nil
+			return m, tea.Batch(m.spinner.Tick, m.fetchBackupFiles())
 		} else {
 			// From local file
 			m.isLocalRestore = true
@@ -1953,6 +2112,7 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 	case viewRestoreFileSelect:
 		if m.cursor < len(m.restoreFileFilteredList) {
 			m.selectedFile = m.restoreFileFilteredList[m.cursor].Name
+			m.selectedFileSize = m.restoreFileFilteredList[m.cursor].Size
 			m.view = viewRestoreConfirm
 			m.cursor = 0
 		}
@@ -2051,9 +2211,11 @@ func (m model) handleEnter() (tea.Model, tea.Cmd) {
 				return m, m.rcloneForm.Init()
 			}
 		case rcloneActionTest:
-			m.view = viewRcloneTest
+			m.view = viewRcloneTestBucket
+			m.rcloneTestFormData = nil // Reset so buildRcloneTestForm allocates fresh
 			m.rcloneTestResult = ""
-			return m, m.runRcloneTestCmd()
+			m.rcloneTestForm = m.buildRcloneTestForm()
+			return m, m.rcloneTestForm.Init()
 		case rcloneActionDelete:
 			m.view = viewRcloneDeleteConfirm
 			m.cursor = confirmNo // Default to "No, go back"
@@ -2310,6 +2472,8 @@ func (m model) View() string {
 		s.WriteString(m.renderConfirmExit())
 	case viewRcloneDeleteConfirm:
 		s.WriteString(m.renderRcloneDeleteConfirm())
+	case viewRcloneTestBucket:
+		s.WriteString(m.renderRcloneTestBucket())
 	case viewRcloneTest:
 		s.WriteString(m.renderRcloneTest())
 	case viewRcloneOAuth:
@@ -2354,6 +2518,8 @@ func (m model) View() string {
 		s.WriteString(dimStyle.Render("type to filter • ↑/↓: navigate • enter: select • esc: back"))
 	case viewRcloneAddForm:
 		s.WriteString(dimStyle.Render("↑/↓/enter: navigate • tab: cycle • ctrl+s: save • ctrl+t: test • esc: back"))
+	case viewRcloneTestBucket:
+		s.WriteString(dimStyle.Render("enter: test • esc: back"))
 	case viewDBTest:
 		if !m.testRunning {
 			s.WriteString(dimStyle.Render("enter: continue"))
@@ -2663,6 +2829,28 @@ func (m model) renderBackupRunning() string {
 		// Show current step with spinner (if not done)
 		if !state.done && state.currentStep != stepIdle {
 			s.WriteString(fmt.Sprintf("    %s %s...\n", m.spinner.View(), state.currentStep.String()))
+
+			// Show progress bar for upload step
+			if state.currentStep == stepUploading && state.uploadBytesTotal > 0 {
+				var pct float64
+				if state.uploadBytesTotal > 0 {
+					pct = float64(state.uploadBytesDone) / float64(state.uploadBytesTotal)
+				}
+
+				// Progress bar
+				s.WriteString("       ")
+				s.WriteString(m.progressBar.ViewAs(pct))
+				s.WriteString("\n")
+
+				// Size and speed info
+				s.WriteString(fmt.Sprintf("       %s / %s",
+					formatFileSize(state.uploadBytesDone),
+					formatFileSize(state.uploadBytesTotal)))
+				if state.uploadSpeed > 0 {
+					s.WriteString(fmt.Sprintf(" • %s/s", formatFileSize(int64(state.uploadSpeed))))
+				}
+				s.WriteString("\n")
+			}
 		}
 	}
 
@@ -2679,7 +2867,7 @@ func (m model) renderRestoreRunning() string {
 	var s strings.Builder
 
 	// Header
-	s.WriteString(fmt.Sprintf("Restoring to %s\n\n", selectedStyle.Render(m.selectedDB)))
+	s.WriteString(fmt.Sprintf("Restoring to %s\n", selectedStyle.Render(m.selectedDB)))
 
 	// Show completed steps
 	for _, entry := range m.restoreLogs {
@@ -2692,7 +2880,31 @@ func (m model) renderRestoreRunning() string {
 
 	// Show current step with spinner
 	if m.restoreStep != restoreStepIdle {
-		s.WriteString(fmt.Sprintf("  %s %s...\n", m.spinner.View(), m.restoreStep.String()))
+		stepStr := m.restoreStep.String()
+		s.WriteString(fmt.Sprintf("  %s %s...\n", m.spinner.View(), stepStr))
+
+		// Show progress bar for download step
+		if m.restoreStep == restoreStepDownloading && m.selectedFileSize > 0 {
+			// Calculate progress percentage
+			var pct float64
+			if m.selectedFileSize > 0 {
+				pct = float64(m.downloadBytesDone) / float64(m.selectedFileSize)
+			}
+
+			// Progress bar
+			s.WriteString("     ")
+			s.WriteString(m.progressBar.ViewAs(pct))
+			s.WriteString("\n")
+
+			// Size and speed info
+			s.WriteString(fmt.Sprintf("     %s / %s",
+				formatFileSize(m.downloadBytesDone),
+				formatFileSize(m.selectedFileSize)))
+			if m.downloadSpeed > 0 {
+				s.WriteString(fmt.Sprintf(" • %s/s", formatFileSize(int64(m.downloadSpeed))))
+			}
+			s.WriteString("\n")
+		}
 	}
 
 	return s.String()
@@ -2809,6 +3021,13 @@ func (m model) renderRestoreLocalInput() string {
 func (m model) renderRestoreFileSelect() string {
 	var s strings.Builder
 	s.WriteString(fmt.Sprintf("Select backup to restore for %s:\n\n", selectedStyle.Render(m.selectedDB)))
+
+	// Show spinner while loading
+	if m.backupFilesLoading {
+		s.WriteString(m.spinner.View())
+		s.WriteString(" Loading backups...\n")
+		return s.String()
+	}
 
 	// Filter input
 	if m.restoreFileFilter != "" {
@@ -3327,6 +3546,32 @@ type restoreStepDoneMsg struct {
 	done      bool // true if restore is complete
 }
 
+// downloadProgressMsg is sent periodically during file download with progress info
+type downloadProgressMsg struct {
+	bytesDone  int64
+	bytesTotal int64
+	speed      float64
+	done       bool
+	err        error
+}
+
+// uploadProgressMsg is sent periodically during file upload with progress info
+type uploadProgressMsg struct {
+	dbName     string
+	bytesDone  int64
+	bytesTotal int64
+	speed      float64
+	done       bool
+	err        error
+}
+
+// startUploadMsg triggers upload with progress tracking
+type startUploadMsg struct {
+	dbName     string
+	backupPath string
+	dest       string
+}
+
 // testResultMsg is sent when a connection/destination test completes
 type testResultMsg struct {
 	testType string // "connection" or "destination"
@@ -3413,7 +3658,8 @@ func (m model) runRetentionPreCheck() tea.Cmd {
 				continue
 			}
 
-			toDelete := retention.Apply(ctx, files, name, db.Retention)
+			// pendingBackups=1 because we're about to create a new backup
+			toDelete := retention.Apply(ctx, files, name, db.Retention, 1)
 			if len(toDelete) > 0 {
 				plan[name] = toDelete
 			}
@@ -3481,19 +3727,11 @@ func (m model) runBackupStepFor(name string) tea.Cmd {
 				}
 			}
 
-			err := storage.Upload(ctx, backupPath, db.Dest)
-			if err != nil {
-				return backupStepDoneMsg{
-					dbName: name,
-					step:   stepUploading,
-					err:    err,
-				}
-			}
-
-			return backupStepDoneMsg{
-				dbName:  name,
-				step:    stepUploading,
-				message: fmt.Sprintf("Saved to %s", formatDestForDisplay(db.Dest, 50)),
+			// Return a message to trigger upload with progress tracking
+			return startUploadMsg{
+				dbName:     name,
+				backupPath: backupPath,
+				dest:       db.Dest,
 			}
 
 		case stepRetention:
@@ -3576,6 +3814,8 @@ func (m model) handleBackupStepDone(msg backupStepDoneMsg) (tea.Model, tea.Cmd) 
 	case stepDumping:
 		state.currentStep = stepUploading
 	case stepUploading:
+		// Clean up upload state
+		delete(m.uploadStates, msg.dbName)
 		state.currentStep = stepRetention
 	case stepRetention:
 		// Clean up the backup result (skip in dry-run so user can access the file)
@@ -3613,6 +3853,64 @@ func (m model) checkAllBackupsDone() tea.Cmd {
 // allBackupsDoneMsg signals all backups are complete
 type allBackupsDoneMsg struct{}
 
+func (m model) handleDownloadProgress(msg downloadProgressMsg) (tea.Model, tea.Cmd) {
+	// Handle download error
+	if msg.err != nil {
+		m.err = msg.err
+		m.view = viewDone
+		m.restoreStep = restoreStepIdle
+		m.restoreLogs = append(m.restoreLogs, restoreLogEntry{
+			Message: "Downloading backup failed",
+			IsError: true,
+		})
+		m.logs = m.buildRestoreSummaryLogs()
+		m.downloadState = nil
+		return m, nil
+	}
+
+	// Update progress
+	m.downloadBytesDone = msg.bytesDone
+	m.downloadSpeed = msg.speed
+
+	// If done, the next message will be restoreStepDoneMsg
+	// Continue waiting for progress updates
+	return m, tea.Batch(m.spinner.Tick, m.waitForDownloadProgress())
+}
+
+func (m model) handleUploadProgress(msg uploadProgressMsg) (tea.Model, tea.Cmd) {
+	state := m.backupStates[msg.dbName]
+	if state == nil {
+		return m, nil
+	}
+
+	// Handle upload error
+	if msg.err != nil {
+		// Clean up upload state
+		delete(m.uploadStates, msg.dbName)
+
+		// Record error and move to next step
+		state.logs = append(state.logs, backupLogEntry{
+			DBName:  msg.dbName,
+			Step:    stepUploading,
+			Message: "Upload failed",
+			IsError: true,
+		})
+		state.done = true
+		state.currentStep = stepIdle
+
+		return m, m.checkAllBackupsDone()
+	}
+
+	// Update progress
+	state.uploadBytesDone = msg.bytesDone
+	state.uploadBytesTotal = msg.bytesTotal
+	state.uploadSpeed = msg.speed
+
+	// If done, the next message will be backupStepDoneMsg
+	// Continue waiting for progress updates
+	return m, tea.Batch(m.spinner.Tick, m.waitForUploadProgress(msg.dbName))
+}
+
 func (m model) handleRestoreStepDone(msg restoreStepDoneMsg) (tea.Model, tea.Cmd) {
 	// Log the completed step
 	entry := restoreLogEntry{
@@ -3629,18 +3927,21 @@ func (m model) handleRestoreStepDone(msg restoreStepDoneMsg) (tea.Model, tea.Cmd
 	if msg.err != nil {
 		m.err = msg.err
 		m.view = viewDone
+		m.restoreStep = restoreStepIdle
 		m.logs = m.buildRestoreSummaryLogs()
 		return m, nil
 	}
 
-	// Save the local path from download step
+	// Save the local path from download step and clean up download state
 	if msg.step == restoreStepDownloading && msg.localPath != "" {
 		m.restoreLocalPath = msg.localPath
+		m.downloadState = nil
 	}
 
 	// Check if done
 	if msg.done {
 		m.view = viewDone
+		m.restoreStep = restoreStepIdle
 		m.logs = m.buildRestoreSummaryLogs()
 		return m, nil
 	}
@@ -3716,57 +4017,48 @@ func (m model) fetchBackupFiles() tea.Cmd {
 
 // startRestore initializes and starts the restore process
 func (m model) startRestore() (tea.Model, tea.Cmd) {
+	// Guard against double submission
+	if m.restoreStep != restoreStepIdle {
+		return m, nil
+	}
+
 	m.restoreLogs = nil
 	m.view = viewRestoreRunning
+	m.downloadBytesDone = 0
+	m.downloadSpeed = 0
+	m.downloadState = nil
 
 	if m.isLocalRestore {
 		// Local restore: skip download, go straight to restoring
 		m.restoreStep = restoreStepRestoring
 		m.restoreLocalPath = m.selectedFile
-	} else {
-		// Remote restore: start with download
-		m.restoreStep = restoreStepDownloading
-		m.restoreLocalPath = ""
+		return m, tea.Batch(m.spinner.Tick, m.runRestoreStep())
 	}
 
-	return m, tea.Batch(m.spinner.Tick, m.runRestoreStep())
+	// Remote restore: start with download
+	m.restoreStep = restoreStepDownloading
+	m.restoreLocalPath = ""
+	m, cmd := m.startDownload()
+	return m, tea.Batch(m.spinner.Tick, cmd)
 }
 
 // runRestoreStep runs the current step in the restore process
 func (m model) runRestoreStep() tea.Cmd {
 	db := m.cfg.Databases[m.selectedDB]
 	step := m.restoreStep
-	selectedFile := m.selectedFile
 	localPath := m.restoreLocalPath
 
-	return func() tea.Msg {
-		ctx := context.Background()
+	switch step {
+	case restoreStepDownloading:
+		// Download progress is handled via downloadState which is set up before this is called
+		ds := m.downloadState
+		if ds == nil {
+			return nil
+		}
+		return m.waitForDownloadProgress()
 
-		switch step {
-		case restoreStepDownloading:
-			tmpDir, err := createTempDir()
-			if err != nil {
-				return restoreStepDoneMsg{
-					step: restoreStepDownloading,
-					err:  err,
-				}
-			}
-
-			if err := storage.Download(ctx, db.Dest, selectedFile, tmpDir); err != nil {
-				return restoreStepDoneMsg{
-					step: restoreStepDownloading,
-					err:  err,
-				}
-			}
-
-			downloadedPath := tmpDir + "/" + selectedFile
-			return restoreStepDoneMsg{
-				step:      restoreStepDownloading,
-				message:   fmt.Sprintf("Downloaded %s", selectedFile),
-				localPath: downloadedPath,
-			}
-
-		case restoreStepRestoring:
+	case restoreStepRestoring:
+		return func() tea.Msg {
 			if err := backup.Restore(db, localPath); err != nil {
 				return restoreStepDoneMsg{
 					step: restoreStepRestoring,
@@ -3780,8 +4072,172 @@ func (m model) runRestoreStep() tea.Cmd {
 				done:    true,
 			}
 		}
+	}
 
+	return nil
+}
+
+// startDownload initializes download state and starts the download goroutine
+// Returns the model with downloadState set and a command to wait for progress
+func (m model) startDownload() (model, tea.Cmd) {
+	db := m.cfg.Databases[m.selectedDB]
+	fileName := m.selectedFile
+	fileSize := m.selectedFileSize
+	remoteDest := db.Dest
+
+	tmpDir, err := createTempDir()
+	if err != nil {
+		// Return an immediate error
+		return m, func() tea.Msg {
+			return downloadProgressMsg{err: err, done: true}
+		}
+	}
+
+	progressCh := make(chan storage.TransferProgress, 10)
+
+	// Store state in heap-allocated struct
+	m.downloadState = &downloadState{
+		progressCh: progressCh,
+		tmpDir:     tmpDir,
+		fileName:   fileName,
+		fileSize:   fileSize,
+	}
+
+	// Start download in a goroutine
+	go storage.DownloadWithProgress(context.Background(), remoteDest, fileName, tmpDir, fileSize, progressCh)
+
+	// Return command to wait for first progress update
+	return m, m.waitForDownloadProgress()
+}
+
+// waitForDownloadProgress waits for the next progress update from the channel
+func (m model) waitForDownloadProgress() tea.Cmd {
+	ds := m.downloadState
+	if ds == nil {
 		return nil
+	}
+
+	return func() tea.Msg {
+		progress, ok := <-ds.progressCh
+		if !ok {
+			// Channel closed, download complete
+			downloadedPath := ds.tmpDir + "/" + ds.fileName
+			return restoreStepDoneMsg{
+				step:      restoreStepDownloading,
+				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, formatFileSize(ds.fileSize)),
+				localPath: downloadedPath,
+			}
+		}
+
+		if progress.Done {
+			if progress.Error != nil {
+				return downloadProgressMsg{err: progress.Error, done: true}
+			}
+			downloadedPath := ds.tmpDir + "/" + ds.fileName
+			return restoreStepDoneMsg{
+				step:      restoreStepDownloading,
+				message:   fmt.Sprintf("Downloaded %s (%s)", ds.fileName, formatFileSize(ds.fileSize)),
+				localPath: downloadedPath,
+			}
+		}
+
+		return downloadProgressMsg{
+			bytesDone:  progress.BytesDone,
+			bytesTotal: progress.BytesTotal,
+			speed:      progress.Speed,
+			done:       false,
+		}
+	}
+}
+
+// startUploadWithProgress initializes upload state and starts the upload goroutine
+func (m model) startUploadWithProgress(dbName, backupPath, dest string) (tea.Model, tea.Cmd) {
+	// Get file size for progress tracking
+	fileInfo, err := os.Stat(backupPath)
+	if err != nil {
+		// Return error as backup step done
+		return m, func() tea.Msg {
+			return backupStepDoneMsg{
+				dbName: dbName,
+				step:   stepUploading,
+				err:    fmt.Errorf("getting file info: %w", err),
+			}
+		}
+	}
+	fileSize := fileInfo.Size()
+
+	// Initialize upload states map if needed
+	if m.uploadStates == nil {
+		m.uploadStates = make(map[string]*uploadState)
+	}
+
+	progressCh := make(chan storage.TransferProgress, 10)
+
+	// Store state in heap-allocated struct
+	m.uploadStates[dbName] = &uploadState{
+		progressCh: progressCh,
+		dbName:     dbName,
+		fileSize:   fileSize,
+	}
+
+	// Initialize progress in backup state
+	if state := m.backupStates[dbName]; state != nil {
+		state.uploadBytesTotal = fileSize
+		state.uploadBytesDone = 0
+		state.uploadSpeed = 0
+	}
+
+	// Start upload in a goroutine
+	go storage.UploadWithProgress(context.Background(), backupPath, dest, fileSize, progressCh)
+
+	// Return command to wait for first progress update
+	return m, m.waitForUploadProgress(dbName)
+}
+
+// waitForUploadProgress waits for the next progress update from the channel
+func (m model) waitForUploadProgress(dbName string) tea.Cmd {
+	us := m.uploadStates[dbName]
+	if us == nil {
+		return nil
+	}
+
+	// Capture dest for the completion message
+	db := m.cfg.Databases[dbName]
+	dest := db.Dest
+
+	return func() tea.Msg {
+		progress, ok := <-us.progressCh
+		if !ok {
+			// Channel closed, upload complete
+			return backupStepDoneMsg{
+				dbName:  dbName,
+				step:    stepUploading,
+				message: fmt.Sprintf("Saved to %s", formatDestForDisplay(dest, 50)),
+			}
+		}
+
+		if progress.Done {
+			if progress.Error != nil {
+				return uploadProgressMsg{
+					dbName: dbName,
+					err:    progress.Error,
+					done:   true,
+				}
+			}
+			return backupStepDoneMsg{
+				dbName:  dbName,
+				step:    stepUploading,
+				message: fmt.Sprintf("Saved to %s", formatDestForDisplay(dest, 50)),
+			}
+		}
+
+		return uploadProgressMsg{
+			dbName:     dbName,
+			bytesDone:  progress.BytesDone,
+			bytesTotal: progress.BytesTotal,
+			speed:      progress.Speed,
+			done:       false,
+		}
 	}
 }
 
@@ -3995,10 +4451,25 @@ func (m model) renderRcloneDeleteConfirm() string {
 	return s.String()
 }
 
+func (m model) renderRcloneTestBucket() string {
+	var s strings.Builder
+
+	s.WriteString(fmt.Sprintf("Test %s\n\n", selectedStyle.Render(m.selectedRemote)))
+	if m.rcloneTestForm != nil {
+		s.WriteString(m.rcloneTestForm.View())
+	}
+
+	return s.String()
+}
+
 func (m model) renderRcloneTest() string {
 	var s strings.Builder
 
-	s.WriteString(fmt.Sprintf("Testing %s\n\n", selectedStyle.Render(m.selectedRemote)))
+	testPath := m.selectedRemote + ":"
+	if m.rcloneTestFormData != nil && m.rcloneTestFormData.bucket != "" {
+		testPath = m.selectedRemote + ":" + m.rcloneTestFormData.bucket
+	}
+	s.WriteString(fmt.Sprintf("Testing %s\n\n", selectedStyle.Render(testPath)))
 
 	if m.rcloneTestResult != "" {
 		s.WriteString(m.rcloneTestResult)
@@ -4345,11 +4816,22 @@ func (m model) saveRcloneRemote() (tea.Model, tea.Cmd) {
 // runRcloneTestCmd runs a connection test for the selected rclone remote
 func (m *model) runRcloneTestCmd() tea.Cmd {
 	remoteName := m.selectedRemote
+	bucket := ""
+	if m.rcloneTestFormData != nil {
+		bucket = m.rcloneTestFormData.bucket
+	}
+
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		err := storage.TestAccess(ctx, remoteName+":")
+		// Build test path - include bucket if provided by user
+		testPath := remoteName + ":"
+		if bucket != "" {
+			testPath = remoteName + ":" + bucket
+		}
+
+		err := storage.TestAccess(ctx, testPath)
 		if err != nil {
 			return rcloneTestResultMsg{
 				success: false,
@@ -4364,8 +4846,9 @@ func (m *model) runRcloneTestCmd() tea.Cmd {
 }
 
 // runRcloneFormTestCmd tests the rclone remote using current form values
-// It temporarily saves the config, tests, and reports results
-func (m *model) runRcloneFormTestCmd() tea.Cmd {
+// It temporarily saves the config, tests, and reports results.
+// If bucket is non-empty, it tests at that bucket path instead of root level.
+func (m *model) runRcloneFormTestCmd(bucket string) tea.Cmd {
 	backend := m.selectedBackend
 	formValues := m.rcloneFormValues
 	isEdit := m.selectedRemote != "" // Check if editing existing remote
@@ -4377,7 +4860,7 @@ func (m *model) runRcloneFormTestCmd() tea.Cmd {
 		// Determine remote name - use temp name to avoid modifying existing config
 		var remoteName string
 		if isEdit {
-			// For edits, use the existing remote name for testing
+			// For edits, use a temp name for testing
 			remoteName = "__test_edit_remote__"
 		} else {
 			if namePtr, ok := formValues["_name"]; ok && namePtr != nil && *namePtr != "" {
@@ -4404,8 +4887,13 @@ func (m *model) runRcloneFormTestCmd() tea.Cmd {
 		// Save config
 		rcloneconfig.SaveConfig()
 
-		// Test the remote
-		err := storage.TestAccess(ctx, remoteName+":")
+		// Build test path - include bucket if provided
+		testPath := remoteName + ":"
+		if bucket != "" {
+			testPath = remoteName + ":" + bucket
+		}
+
+		err := storage.TestAccess(ctx, testPath)
 
 		// Clean up temp remote if we created one
 		if remoteName == "__test_temp_remote__" || remoteName == "__test_edit_remote__" {

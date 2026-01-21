@@ -156,7 +156,7 @@ func TestApplyKeepLast(t *testing.T) {
 
 	t.Run("keep 3 deletes 2", func(t *testing.T) {
 		ret := config.Retention{KeepLast: 3}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 2 {
 			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
 		}
@@ -168,7 +168,7 @@ func TestApplyKeepLast(t *testing.T) {
 
 	t.Run("keep more than exists", func(t *testing.T) {
 		ret := config.Retention{KeepLast: 10}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 0 {
 			t.Errorf("expected 0 to delete, got %d", len(toDelete))
 		}
@@ -181,7 +181,7 @@ func TestApplyKeepLast(t *testing.T) {
 			{Name: "mydb_20240115_130000.sql.gz", Size: 100},
 		}
 		ret := config.Retention{KeepLast: 1}
-		toDelete := Apply(ctx, mixedFiles, "mydb", ret)
+		toDelete := Apply(ctx, mixedFiles, "mydb", ret, 0)
 		if len(toDelete) != 1 {
 			t.Fatalf("expected 1 to delete, got %d", len(toDelete))
 		}
@@ -205,7 +205,7 @@ func TestApplyKeepDays(t *testing.T) {
 
 	t.Run("keep 5 days deletes old", func(t *testing.T) {
 		ret := config.Retention{KeepDays: 5}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 2 {
 			t.Fatalf("expected 2 to delete (7 and 10 days old), got %d", len(toDelete))
 		}
@@ -224,7 +224,7 @@ func TestApplyMaxSize(t *testing.T) {
 
 	t.Run("max 12MB keeps 2", func(t *testing.T) {
 		ret := config.Retention{MaxSizeMB: 12}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		// Total: 20MB, max: 12MB
 		// Keep first 2 (10MB), delete 2 (10MB)
 		if len(toDelete) != 2 {
@@ -251,7 +251,7 @@ func TestApplyCombinedRules(t *testing.T) {
 		// keep_days: 7 would delete file 5 (10 days old)
 		// Combined: should delete files 4 and 5
 		ret := config.Retention{KeepLast: 3, KeepDays: 7}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 2 {
 			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
 		}
@@ -263,7 +263,7 @@ func TestApplyCombinedRules(t *testing.T) {
 		// max_size_mb: 5 would delete file 5 (cumulative 14MB > 5MB)
 		// Combined: should delete files 4 and 5 (union of all rules)
 		ret := config.Retention{KeepLast: 4, KeepDays: 3, MaxSizeMB: 5}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 2 {
 			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
 		}
@@ -271,9 +271,61 @@ func TestApplyCombinedRules(t *testing.T) {
 
 	t.Run("no rules configured", func(t *testing.T) {
 		ret := config.Retention{}
-		toDelete := Apply(ctx, files, "mydb", ret)
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
 		if len(toDelete) != 0 {
 			t.Fatalf("expected 0 to delete when no rules, got %d", len(toDelete))
+		}
+	})
+}
+
+func TestApplyPendingBackups(t *testing.T) {
+	ctx := context.Background()
+
+	// 5 existing files
+	files := []storage.RemoteFile{
+		{Name: "mydb_20240115_150000.sql.gz", Size: 100},
+		{Name: "mydb_20240115_140000.sql.gz", Size: 100},
+		{Name: "mydb_20240115_130000.sql.gz", Size: 100},
+		{Name: "mydb_20240115_120000.sql.gz", Size: 100},
+		{Name: "mydb_20240115_110000.sql.gz", Size: 100},
+	}
+
+	t.Run("keep 5 with 0 pending keeps all", func(t *testing.T) {
+		ret := config.Retention{KeepLast: 5}
+		toDelete := Apply(ctx, files, "mydb", ret, 0)
+		if len(toDelete) != 0 {
+			t.Fatalf("expected 0 to delete, got %d", len(toDelete))
+		}
+	})
+
+	t.Run("keep 5 with 1 pending deletes 1", func(t *testing.T) {
+		// If we're about to add 1 backup, we should only keep 4 existing
+		ret := config.Retention{KeepLast: 5}
+		toDelete := Apply(ctx, files, "mydb", ret, 1)
+		if len(toDelete) != 1 {
+			t.Fatalf("expected 1 to delete, got %d", len(toDelete))
+		}
+		// Should delete the oldest
+		if toDelete[0].Name != "mydb_20240115_110000.sql.gz" {
+			t.Errorf("expected oldest to be deleted, got %s", toDelete[0].Name)
+		}
+	})
+
+	t.Run("keep 5 with 2 pending deletes 2", func(t *testing.T) {
+		ret := config.Retention{KeepLast: 5}
+		toDelete := Apply(ctx, files, "mydb", ret, 2)
+		if len(toDelete) != 2 {
+			t.Fatalf("expected 2 to delete, got %d", len(toDelete))
+		}
+	})
+
+	t.Run("pending backups more than keep_last deletes all", func(t *testing.T) {
+		// If keepLast=2 and pending=3, effectiveKeepLast becomes 0 (clamped)
+		// But we still have 5 files, so we delete all 5
+		ret := config.Retention{KeepLast: 2}
+		toDelete := Apply(ctx, files, "mydb", ret, 3)
+		if len(toDelete) != 5 {
+			t.Fatalf("expected 5 to delete, got %d", len(toDelete))
 		}
 	})
 }

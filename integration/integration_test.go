@@ -368,6 +368,15 @@ func TestRetention(t *testing.T) {
 		t.Skip("Skipping integration test in short mode")
 	}
 
+	// Clear backup directory first
+	for _, subdir := range []string{"mysql", "mariadb", "postgres"} {
+		dir := filepath.Join(backupDir, subdir)
+		files, _ := os.ReadDir(dir)
+		for _, f := range files {
+			os.Remove(filepath.Join(dir, f.Name()))
+		}
+	}
+
 	// Create multiple backups
 	for i := 0; i < 5; i++ {
 		output, err := runBlobber("backup")
@@ -378,13 +387,16 @@ func TestRetention(t *testing.T) {
 	}
 
 	// Check that retention policy was applied (keep_last: 3)
+	// With 5 backups and keep_last: 3, we should have exactly 3 files.
+	// The retention is calculated BEFORE each backup with pendingBackups=1,
+	// so it correctly accounts for the new backup being added.
 	for _, subdir := range []string{"mysql", "mariadb", "postgres"} {
 		files, err := os.ReadDir(filepath.Join(backupDir, subdir))
 		if err != nil {
 			t.Fatalf("Failed to read backup dir: %v", err)
 		}
-		if len(files) > 3 {
-			t.Errorf("Expected at most 3 files in %s (retention policy), found %d", subdir, len(files))
+		if len(files) != 3 {
+			t.Errorf("Expected exactly 3 files in %s (keep_last: 3), found %d", subdir, len(files))
 		}
 	}
 }

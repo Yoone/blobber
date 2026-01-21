@@ -76,7 +76,8 @@ func PreCheckRetention(ctx context.Context, cfg *config.Config, databases []stri
 			continue // skip on error, don't fail the whole check
 		}
 
-		toDelete := retention.Apply(ctx, files, name, db.Retention)
+		// pendingBackups=1 because we're about to create a new backup
+		toDelete := retention.Apply(ctx, files, name, db.Retention, 1)
 		if len(toDelete) > 0 {
 			plan[name] = toDelete
 		}
@@ -180,7 +181,8 @@ func runSingleBackup(ctx context.Context, cfg *config.Config, name string, opts 
 			return result
 		}
 
-		toDelete := retention.Apply(ctx, files, name, db.Retention)
+		// pendingBackups=0 because the new backup already exists in files list
+		toDelete := retention.Apply(ctx, files, name, db.Retention, 0)
 		if len(toDelete) > 0 {
 			var deleted int
 			for _, f := range toDelete {

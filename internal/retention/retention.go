@@ -74,7 +74,9 @@ func filterByName(files []storage.RemoteFile, dbName string) []backupFile {
 // Apply applies the retention policy and returns files to delete.
 // Only considers files matching the database name and naming convention.
 // Multiple retention rules can be combined - a file is deleted if ANY rule marks it for deletion.
-func Apply(ctx context.Context, files []storage.RemoteFile, dbName string, retention config.Retention) []storage.RemoteFile {
+// The pendingBackups parameter indicates how many new backups will be added after this calculation,
+// so the retention policy accounts for them (e.g., if keepLast=5 and pendingBackups=1, we keep 4 existing).
+func Apply(ctx context.Context, files []storage.RemoteFile, dbName string, retention config.Retention, pendingBackups int) []storage.RemoteFile {
 	if len(files) == 0 {
 		return nil
 	}
@@ -90,7 +92,12 @@ func Apply(ctx context.Context, files []storage.RemoteFile, dbName string, reten
 
 	// Apply all configured rules - files are deleted if ANY rule says to delete
 	if retention.KeepLast > 0 {
-		for _, f := range applyKeepLast(filtered, retention.KeepLast) {
+		// Account for pending backups: if we're about to add N backups, keep N fewer existing files
+		effectiveKeepLast := retention.KeepLast - pendingBackups
+		if effectiveKeepLast < 0 {
+			effectiveKeepLast = 0
+		}
+		for _, f := range applyKeepLast(filtered, effectiveKeepLast) {
 			toDeleteMap[f.Name] = f
 		}
 	}
