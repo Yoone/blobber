@@ -8,6 +8,65 @@ import (
 	"testing"
 )
 
+func TestCollapsePath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("failed to get home dir: %v", err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get cwd: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "absolute path in home directory",
+			input:    filepath.Join(home, ".config", "blobber", "config.yaml"),
+			expected: "~/.config/blobber/config.yaml",
+		},
+		{
+			name:     "absolute path outside home directory",
+			input:    "/etc/blobber/config.yaml",
+			expected: "/etc/blobber/config.yaml",
+		},
+		{
+			name:     "home directory itself",
+			input:    home,
+			expected: "~",
+		},
+	}
+
+	// Add test for relative path - should be made absolute first
+	// If cwd is under home, result should use ~; otherwise absolute path
+	if strings.HasPrefix(cwd, home) {
+		relInHome := "blobber.yaml"
+		expectedRel := "~" + cwd[len(home):] + "/blobber.yaml"
+		tests = append(tests, struct {
+			name     string
+			input    string
+			expected string
+		}{
+			name:     "relative path in home directory becomes absolute with tilde",
+			input:    relInHome,
+			expected: expectedRel,
+		})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := collapsePath(tt.input)
+			if result != tt.expected {
+				t.Errorf("collapsePath(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
 func TestExpandPath(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {

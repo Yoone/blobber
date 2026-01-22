@@ -24,7 +24,7 @@ build:
 
 .PHONY: run
 run: build
-	./blobber
+	./blobber -c blobber.yaml
 
 # Run unit tests only
 .PHONY: test

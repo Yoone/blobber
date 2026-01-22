@@ -70,7 +70,7 @@ blobber version
 
 ## Quick Start
 
-1. Create a config file `blobber.yaml`:
+1. Create a config file `~/.config/blobber/config.yaml`:
 
 ```yaml
 databases:
@@ -90,12 +90,12 @@ databases:
 2. Run blobber:
 
 ```bash
-./blobber
+blobber
 ```
 
 ## Configuration
 
-Blobber uses a YAML configuration file. By default, it looks for `blobber.yaml` in the current directory.
+Blobber uses a YAML configuration file. By default, it looks for `~/.config/blobber/config.yaml`. If `./blobber.yaml` exists in the current directory, it will be used instead (useful for project-specific configs).
 
 ### Database Configuration
 
@@ -175,7 +175,7 @@ Blobber uses [rclone](https://rclone.org/) internally for cloud storage. You can
 To use a custom rclone config file:
 
 ```bash
-./blobber --rclone-config /path/to/rclone.conf
+blobber --rclone-config /path/to/rclone.conf
 ```
 
 ## Usage
@@ -185,9 +185,9 @@ To use a custom rclone config file:
 Launch the interactive terminal interface:
 
 ```bash
-./blobber                              # Uses ./blobber.yaml
-./blobber -c /path/to/config.yaml      # Custom config path
-./blobber --rclone-config ~/rclone.conf  # Custom rclone config
+blobber                                  # Uses ~/.config/blobber/config.yaml
+blobber -c /path/to/config.yaml          # Custom config path
+blobber --rclone-config ~/rclone.conf    # Custom rclone config
 ```
 
 ### CLI Mode
@@ -196,7 +196,7 @@ Launch the interactive terminal interface:
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--config` | `-c` | Path to config file (default: `./blobber.yaml`) |
+| `--config` | `-c` | Path to config file (default: `~/.config/blobber/config.yaml`) |
 | `--rclone-config` | | Path to rclone config file (default: `~/.config/rclone/rclone.conf`) |
 
 #### `blobber backup`
@@ -204,11 +204,11 @@ Launch the interactive terminal interface:
 Run database backups.
 
 ```bash
-blobber backup                    # Backup all databases
-blobber backup mydb               # Backup specific database
-blobber backup db1 db2            # Backup multiple databases
-blobber backup --dry-run          # Dump only, skip upload
-blobber backup --skip-retention   # Skip retention policy cleanup
+blobber backup                   # Backup all databases
+blobber backup mydb              # Backup specific database
+blobber backup db1 db2           # Backup multiple databases
+blobber backup --dry-run         # Dump only, skip upload
+blobber backup --skip-retention  # Skip retention policy cleanup
 ```
 
 | Flag | Description |
@@ -231,8 +231,8 @@ Output shows backup filename, size, and timestamp.
 Restore a database from backup.
 
 ```bash
-blobber restore mydb backup_2024-01-15_120000.sql.gz        # From remote
-blobber restore --local mydb /path/to/local/backup.sql.gz   # From local file
+blobber restore mydb backup_2024-01-15_120000.sql.gz       # From remote
+blobber restore --local mydb /path/to/local/backup.sql.gz  # From local file
 ```
 
 | Flag | Description |

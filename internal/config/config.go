@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -119,6 +120,12 @@ func (c *Config) Save() error {
 	enc.SetIndent(2)
 	if err := enc.Encode(c); err != nil {
 		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	// Create parent directory if it doesn't exist
+	dir := filepath.Dir(c.path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating config directory: %w", err)
 	}
 
 	if err := os.WriteFile(c.path, buf.Bytes(), 0644); err != nil {

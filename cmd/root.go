@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Yoone/blobber/internal/config"
 	"github.com/Yoone/blobber/internal/storage"
@@ -51,15 +52,24 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (default: ./blobber.yaml)")
+	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (default: ~/.config/blobber/config.yaml)")
 	rootCmd.PersistentFlags().StringVar(&rcloneCfgFile, "rclone-config", "", "rclone config file (default: ~/.config/rclone/rclone.conf)")
+}
+
+// defaultConfigPath returns the default config path (~/.config/blobber/config.yaml)
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "blobber.yaml"
+	}
+	return filepath.Join(home, ".config", "blobber", "config.yaml")
 }
 
 func getConfigPath() string {
 	if cfgFile != "" {
 		return cfgFile
 	}
-	return "blobber.yaml"
+	return defaultConfigPath()
 }
 
 func loadConfigAllowEmpty() error {

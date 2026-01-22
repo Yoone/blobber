@@ -53,18 +53,21 @@ release:
   prerelease: auto
   name_template: "v{{.Version}}"
 
-brews:
+homebrew_casks:
   - name: blobber
     repository:
       owner: Yoone
       name: homebrew-tap
       git:
         url: "git@github.com:Yoone/homebrew-tap.git"
-    directory: Formula
+        private_key: "{{ .Env.HOMEBREW_TAP_DEPLOY_KEY }}"
+    directory: Casks
     homepage: "https://github.com/Yoone/blobber"
     description: "Database backup and restore tool with cloud storage support"
-    license: "MIT"
-    install: |
-      bin.install "blobber"
-    test: |
-      system "#{bin}/blobber", "version"
+    # Remove quarantine since binary isn't signed
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/blobber"]
+          end

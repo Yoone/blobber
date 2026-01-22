@@ -369,6 +369,21 @@ func expandDest(dest string) string {
 	return dest
 }
 
+// collapsePath converts a path to absolute and replaces home directory prefix with ~
+func collapsePath(path string) string {
+	// Make path absolute if it's relative
+	if !filepath.IsAbs(path) {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+	}
+	// Replace home directory prefix with ~
+	if home, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, home) {
+		return "~" + path[len(home):]
+	}
+	return path
+}
+
 // formatDestForDisplay formats a destination path for user-friendly display
 // It tries to show relative paths when possible, uses ~ for home directory,
 // and truncates only if still too long
@@ -2556,7 +2571,7 @@ func (m model) View() string {
 func (m model) renderMainMenu() string {
 	var s strings.Builder
 
-	cfgPath, _ := filepath.Abs(m.cfg.Path())
+	cfgPath := collapsePath(m.cfg.Path())
 	dbCount := len(m.dbNames)
 	if dbCount == 0 {
 		s.WriteString(dimStyle.Render(fmt.Sprintf("No databases configured (config: %s)", cfgPath)))
@@ -3387,7 +3402,7 @@ func (m model) saveNewDatabase() (tea.Model, tea.Cmd) {
 	if m.testDestResult != "" {
 		m.logs = append(m.logs, m.testDestResult)
 	}
-	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", m.cfg.Path())))
+	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", collapsePath(m.cfg.Path()))))
 	m.view = viewDone
 
 	return m, nil
@@ -3472,7 +3487,7 @@ func (m model) saveEditedDatabase() (tea.Model, tea.Cmd) {
 	if m.testDestResult != "" {
 		m.logs = append(m.logs, m.testDestResult)
 	}
-	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", m.cfg.Path())))
+	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", collapsePath(m.cfg.Path()))))
 	m.view = viewDone
 	m.editingDB = ""
 
@@ -3508,7 +3523,7 @@ func (m model) deleteDatabase() (tea.Model, tea.Cmd) {
 
 	// Show success
 	m.logs = []string{successStyle.Render(fmt.Sprintf("Database '%s' deleted.", name))}
-	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", m.cfg.Path())))
+	m.logs = append(m.logs, dimStyle.Render(fmt.Sprintf("Config saved to %s", collapsePath(m.cfg.Path()))))
 	m.view = viewDone
 	m.editingDB = ""
 
