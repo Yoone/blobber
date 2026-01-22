@@ -1,5 +1,7 @@
 # Blobber
 
+![Blobber Demo](.github/assets/blobber-demo.gif)
+
 CLI for automated backups. TUI for guided restores. Restores matter as much as backups, and during an incident you don't want to be digging through docs for CLI flags. Supports MySQL, MariaDB, PostgreSQL, and SQLite to local or cloud storage (via rclone).
 
 ## Features
