@@ -222,6 +222,7 @@ type uploadState struct {
 
 type model struct {
 	cfg                *config.Config
+	version            string
 	view               view
 	cursor             int
 	width              int // terminal width for dynamic sizing
@@ -1107,7 +1108,7 @@ func checkRequiredUtilities(dbType string) []string {
 	return warnings
 }
 
-func Run(cfg *config.Config) error {
+func Run(cfg *config.Config, version string) error {
 	// Get sorted database names
 	var dbNames []string
 	for name := range cfg.Databases {
@@ -1131,6 +1132,7 @@ func Run(cfg *config.Config) error {
 
 	m := model{
 		cfg:            cfg,
+		version:        version,
 		view:           viewMainMenu,
 		dbNames:        dbNames,
 		dbFilteredList: dbNames, // Initialize filtered list with all databases
@@ -2331,7 +2333,7 @@ func (m model) View() string {
 
 	s.WriteString(titleStyle.Render("░█▀▄░█░░░█▀█░█▀▄░█▀▄░█▀▀░█▀▄"))
 	s.WriteString("\n")
-	s.WriteString(titleStyle.Render("░█▀▄░█░░░█░█░█▀▄░█▀▄░█▀▀░█▀▄   Database Backup & Restore Tool"))
+	s.WriteString(titleStyle.Render("░█▀▄░█░░░█░█░█▀▄░█▀▄░█▀▀░█▀▄   Database Backup & Restore Tool (" + m.version + ")"))
 	s.WriteString("\n")
 	s.WriteString(titleStyle.Render("░▀▀░░▀▀▀░▀▀▀░▀▀░░▀▀░░▀▀▀░▀░▀"))
 	s.WriteString("\n\n")

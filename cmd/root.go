@@ -7,6 +7,7 @@ import (
 	"github.com/Yoone/blobber/internal/config"
 	"github.com/Yoone/blobber/internal/storage"
 	"github.com/Yoone/blobber/internal/tui"
+	"github.com/Yoone/blobber/internal/version"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -39,7 +40,7 @@ Run without arguments to launch the interactive TUI.`,
 			return cmd.Help()
 		}
 		// Launch TUI
-		return tui.Run(cfg)
+		return tui.Run(cfg, version.String())
 	},
 }
 

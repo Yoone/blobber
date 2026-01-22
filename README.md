@@ -1,6 +1,6 @@
 # Blobber
 
-A database backup tool with an interactive TUI and CLI. Back up MySQL, MariaDB, PostgreSQL, and SQLite databases to local storage or any cloud provider supported by rclone.
+CLI for automated backups. TUI for guided restores. Restores matter as much as backups, and during an incident you don't want to be digging through docs for CLI flags. Supports MySQL, MariaDB, PostgreSQL, and SQLite to local or cloud storage (via rclone).
 
 ## Features
 
@@ -24,19 +24,49 @@ Ensure the required tools are installed and available in your `PATH`.
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install Yoone/tap/blobber
+```
+
+### Install Script (Linux/macOS)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Yoone/blobber/main/install.sh | sh
+```
+
+Or specify a version and install directory:
+
+```bash
+VERSION=v0.1.0 INSTALL_DIR=/opt/bin curl -sSL https://raw.githubusercontent.com/Yoone/blobber/main/install.sh | sh
+```
+
+### Go Install
+
+```bash
+go install github.com/Yoone/blobber@latest
+```
+
 ### From Source
 
 ```bash
-git clone https://github.com/Yoone/blobber.git
+git clone git@github.com:Yoone/blobber.git
 cd blobber
 make
 ```
 
 ### Prerequisites
 
-- [Go 1.21+](https://go.dev/dl/) to build from source
+- [Go 1.24+](https://go.dev/dl/) to build from source
 - Database tools for your DBMS (see table above)
 - rclone CLI (optional - only needed if configuring remotes outside the TUI)
+
+### Verify Installation
+
+```bash
+blobber version
+```
 
 ## Quick Start
 

@@ -1,0 +1,70 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: blobber
+    main: .
+    binary: blobber
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/Yoone/blobber/internal/version.Version={{.Version}}
+      - -X github.com/Yoone/blobber/internal/version.Commit={{.ShortCommit}}
+      - -X github.com/Yoone/blobber/internal/version.Date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README*
+      - blobber.example.yaml
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: Yoone
+    name: blobber
+  draft: false
+  prerelease: auto
+  name_template: "v{{.Version}}"
+
+brews:
+  - name: blobber
+    repository:
+      owner: Yoone
+      name: homebrew-tap
+      git:
+        url: "git@github.com:Yoone/homebrew-tap.git"
+    directory: Formula
+    homepage: "https://github.com/Yoone/blobber"
+    description: "Database backup and restore tool with cloud storage support"
+    license: "MIT"
+    install: |
+      bin.install "blobber"
+    test: |
+      system "#{bin}/blobber", "version"

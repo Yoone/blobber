@@ -1,3 +1,12 @@
+# Version info from git
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
+DATE    ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+LDFLAGS := -s -w \
+	-X github.com/Yoone/blobber/internal/version.Version=$(VERSION) \
+	-X github.com/Yoone/blobber/internal/version.Commit=$(COMMIT) \
+	-X github.com/Yoone/blobber/internal/version.Date=$(DATE)
+
 .PHONY: all
 all: fmt vendor build
 
@@ -11,7 +20,7 @@ vendor:
 
 .PHONY: build
 build:
-	go build -o blobber .
+	go build -ldflags "$(LDFLAGS)" -o blobber .
 
 .PHONY: run
 run: build
