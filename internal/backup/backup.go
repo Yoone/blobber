@@ -198,6 +198,16 @@ func newCompressWriter(dst io.Writer, compression, filename string) (io.Writer, 
 	}
 }
 
+// mysqlDumpSupportsColumnStats checks if mysqldump supports --column-statistics option (MySQL 8.0+)
+func mysqlDumpSupportsColumnStats() bool {
+	cmd := exec.Command("mysqldump", "--help")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(output), "column-statistics")
+}
+
 func dumpMySQL(db config.Database, outPath string) error {
 	// Test connection first with timeout (mysqldump doesn't support --connect-timeout)
 	if err := TestConnection(db); err != nil {
@@ -208,10 +218,14 @@ func dumpMySQL(db config.Database, outPath string) error {
 		"-h", db.Host,
 		"-P", fmt.Sprintf("%d", db.Port),
 		"-u", db.User,
-		"--column-statistics=0", // Compatibility with MariaDB
-		"--add-drop-table",      // Include DROP TABLE for clean restore
-		db.Database,
 	}
+
+	// Only add --column-statistics=0 if supported (MySQL 8.0+, not MariaDB)
+	if mysqlDumpSupportsColumnStats() {
+		args = append(args, "--column-statistics=0")
+	}
+
+	args = append(args, "--add-drop-table", db.Database)
 
 	cmd := exec.Command("mysqldump", args...)
 	if db.Password != "" {
